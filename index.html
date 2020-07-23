@@ -1,0 +1,68 @@
+<span>Input: </span>
+<p id="code" contenteditable="true">return 1 + 1</p>
+
+<span>Output: </span>
+<p id="output"></p>
+
+<script src="fengari-web.js" type="text/javascript"></script>
+
+<!--
+<script>
+document.getElementById("code").addEventListener("input", function() {
+
+	// TODO: Rewrite this block in Lua, so we can use xpcall on bad code and return a proper traceback.
+
+	document.getElementById('output').textContent = '...';
+	var x = fengari.load(document.getElementById('code').textContent)();
+	document.getElementById('output').textContent = x;
+});
+</script>
+-->
+
+<script type="application/lua">
+local luaj = require "luaj"
+local js = require "js"
+local window = js.global
+local document = window.document
+
+local luaj_print = function(...)
+	local args = {...}
+	for _, val in ipairs(args) do
+		document:getElementById("output").textContent = document:getElementById("output").textContent .. '\t' .. tostring(val)
+	end
+end
+
+document:getElementById("code"):addEventListener("input", function()
+	document:getElementById("output").textContent = '...';
+
+	local line = document:getElementById("code").textContent;
+
+	local fn, err = luaj.load(line, "stdin")
+	if err ~= nil then
+		document:getElementById("output").textContent = 'ERROR: ' .. err
+	else
+		local vals = {fn()}
+		document:getElementById("output").textContent = ''
+		for k, v in pairs(vals) do
+			if type(v) == 'table' then
+				document:getElementById("output").textContent = "table:"
+				for k1, k2 in pairs(v) do
+					document:getElementById("output").textContent = document:getElementById("output").textContent .. '\n' .. tostring(k1) .. '\t' .. tostring(v2)
+				end
+			else
+				document:getElementById("output").textContent = document:getElementById("output").textContent .. tostring(v)
+			end
+		end
+	end
+
+end)
+
+local env = luaj._make_env("webrepl")
+env.print = luaj_print
+
+local func, err = luaj.load("return 1 + 2", "luaj_code", nil, env)
+if err ~= nil then
+	print(err .. '\n')
+end
+print(func())
+</script>
