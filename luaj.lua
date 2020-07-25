@@ -5,7 +5,7 @@ local unpack = unpack or table.unpack
 
 local load_source = nil
 
-local luaj_version = {0,4,0,'alpha'}
+local luaj_version = {0,5,0,'alpha'}
 
 local version = function()
 	local idx = _VERSION:find(" ") + 1
@@ -1109,7 +1109,14 @@ local open_csv = function(root)
 
 
 				if type(row[key]) == 'number' then
-					x[#x+1] = string.format("%f", row[key])
+					if math.type(row[key]) == 'integer' then
+						x[#x+1] = string.format("%d", row[key])
+					else
+						local float_rep = string.format("%f", row[key])
+						x[#x+1] = string.gsub(float_rep, "%.?0+$", "")
+					end
+				elseif row[key] == nil then
+					x[#x+1] = ''
 				else
 					x[#x+1] = string.format("%q", row[key])
 				end
@@ -1131,9 +1138,6 @@ local open_class = function(root)
 	root['class'] = {}
 
 	local r = root['class']
-
-	-- TODO: Can we somehow inherit metamethods?
-	-- So that we can do class_obj.__type = "x"
 
 	r['Class'] = function(name, ...)
 		local c = {}
@@ -1374,6 +1378,7 @@ end
 
 -- TODO: TOML library
 -- TODO: Parser Library
+-- TODO: Datalog library
 
 local open_uuid = function(root)
 	root['uuid'] = {}
@@ -1810,17 +1815,8 @@ local open_io = function(root)
 	-- open/close are moved to base available.
 	r['io'] = {}
 	
-	-- TODO: This is hard-linked to io.stdout... So do we need it?
-	r['io']['flush'] = io.flush
-	
 	r['io']['popen'] = io.popen
 	r['io']['lines'] = io.lines
-
-	-- TODO: This is hard-linked to io.stdout... So do we need it?
-	r['io']['write'] = io.write
-
-	-- TODO: This is hard-linked to io.stdin... So do we need it?
-	r['io']['read'] = io.read
 
 	r['io']['tmpfile'] = io.tmpfile
 
@@ -1854,8 +1850,6 @@ local open_io = function(root)
 	r['io']['dirname'] = dirname
 
 	r['io']['datapath'] = datapath
-
-	-- TODO: Opinion. Should we have io.input and io.output?
 
 	local meta = getmetatable(r['io']) or {}
 	meta.__type = "library"
@@ -2049,6 +2043,334 @@ local open_table = function(root)
 	return r
 end
 
+local open_matrix = function(matrix)
+	-- Self referencing...
+	matrix.__index = matrix
+
+	matrix.constructor = function(self, data)
+		local rows = #data
+		local columns = #data[1]
+
+		local ret = self:new(columns, rows)
+
+		for i = 1, columns do
+			for j = 1, rows do
+				ret:insert(data[j][i], i, j)
+			end
+		end
+
+		return ret
+	end
+
+	matrix.new = function(self, columns, rows)
+		self = {}
+		self._col = columns
+		self._row = rows
+		self._mtx = {}
+
+		for i=1, columns * rows do
+			self._mtx[i] = 0
+		end
+
+		local meta = {}
+		meta.__type = 'matrix'
+
+		meta.__eq = matrix.equal
+		meta.__add = matrix.add
+		meta.__sub = matrix.subtract
+		meta.__mul = matrix.multiply
+		meta.__div = matrix.divide
+
+		meta.__tostring = function(self)
+			return string.format("matrix(%d, %d)", self._col, self._row)
+		end
+
+		meta.__index = function(self, key)
+			if rawget(self, key) == nil then
+				return matrix[key]
+			else
+				return rawget(self, key)
+			end
+		end
+
+		meta.__call = matrix.index
+
+		setmetatable(self, meta)
+
+		return self
+	end
+
+	matrix.columns = function(self)
+		return self._col
+	end
+	matrix.rows = function(self)
+		return self._row
+	end
+
+	matrix.index = function(self, column, row)
+		local c = column - 1
+		local r = row - 1
+
+		return self._mtx[c + r * self._col + 1]
+	end
+
+	matrix.insert = function(self, value, column, row)
+		local c = column - 1
+		local r = row - 1
+
+		self._mtx[c + r * self._col + 1] = value
+	end
+
+	matrix.equal = function(a, b)
+		-- If either isn't a matrix then false
+		if luaj_type(a) ~= 'matrix' or
+			luaj_type(b) ~= 'matrix'
+		then
+			return false
+		end
+
+		-- Differing matrices are false
+		if a:columns() ~= b:columns() or
+			a:rows() ~= b:rows()
+		then
+			return false
+		end
+
+		-- Check all values are the same
+		for i=1, a:columns() do
+			for j=1, a:rows() do
+				if a:index(i, j) ~= b:index(i, j) then
+					return false
+				end
+			end
+		end
+
+		return true
+	end
+
+	matrix.add = function(a, b)
+		local adder = function(value, m, reverse)
+			local out = matrix:new(m:columns(), m:rows())
+
+			for i=1, m:columns() do
+				for j=1, m:rows() do
+					if reverse == true then
+						out:insert(value + m:index(i, j), i, j)
+					else
+						out:insert(m:index(i, j) + value, i, j)
+					end
+				end
+			end
+
+			return out
+		end
+
+		-- Adding numbers
+		if type(a) == 'number' then
+			return adder(a, b)
+		elseif type(b) == 'number' then
+			return adder(b, a)
+		end
+
+		-- Adding matrices
+
+		-- Check that we have the same size
+		if a:columns() ~= b:columns() or
+			a:rows() ~= b:rows()
+		then
+			return nil
+		end
+
+		local out = matrix:new(a:columns(), a:rows())
+
+		for i=1, a:columns() do
+			for j=1, a:rows() do
+				out:insert(a:index(i, j) + b:index(i, j), i, j)
+			end
+		end
+
+		return out
+	end
+
+	matrix.subtract = function(a, b)
+		local subber = function(value, m, reverse)
+			local out = matrix:new(m:columns(), m:rows())
+
+			for i=1, m:columns() do
+				for j=1, m:rows() do
+					if reverse == true then
+						out:insert(value - m:index(i, j), i, j)
+					else
+						out:insert(m:index(i, j) - value, i, j)
+					end
+				end
+			end
+
+			return out
+		end
+
+		-- Adding numbers
+		if type(a) == 'number' then
+			return subber(a, b, true)
+		elseif type(b) == 'number' then
+			return subber(b, a)
+		end
+
+		-- Adding matrices
+
+		-- Check that we have the same size
+		if a:columns() ~= b:columns() or
+			a:rows() ~= b:rows()
+		then
+			return nil
+		end
+
+		local out = matrix:new(a:columns(), a:rows())
+
+		for i=1, a:columns() do
+			for j=1, a:rows() do
+				out:insert(a:index(i, j) - b:index(i, j), i, j)
+			end
+		end
+
+		return out
+	end
+
+	matrix.multiply = function(a, b)
+		local multiplier = function(value, m, reverse)
+			local out = matrix:new(m:columns(), m:rows())
+
+			for i=1, m:columns() do
+				for j=1, m:rows() do
+					if reverse then
+						out:insert(value * m:index(i, j), i, j)
+					else
+						out:insert(m:index(i, j) * value, i, j)
+					end
+				end
+			end
+
+			return out
+		end
+
+		-- Adding numbers
+		if type(a) == 'number' then
+			return multiplier(a, b, true)
+		elseif type(b) == 'number' then
+			return multiplier(b, a)
+		end
+
+		-- Adding matrices
+
+		-- Check that we have the same size
+		if a:columns() ~= b:columns() or
+			a:rows() ~= b:rows()
+		then
+			return nil
+		end
+
+		local out = matrix:new(a:columns(), a:rows())
+
+		for i=1, a:columns() do
+			for j=1, a:rows() do
+				out:insert(a:index(i, j) * b:index(i, j), i, j)
+			end
+		end
+
+		return out
+	end
+
+	matrix.divide = function(a, b)
+		local divider = function(value, m, reverse)
+			if value == 0 then
+				return nil
+			end
+
+			local out = matrix:new(m:columns(), m:rows())
+
+			for i=1, m:columns() do
+				for j=1, m:rows() do
+					if reverse == true then
+						out:insert(value / m:index(i, j), i, j)
+					else
+						out:insert(m:index(i, j) / value, i, j)
+					end
+				end
+			end
+
+			return out
+		end
+
+		-- Adding numbers
+		if type(a) == 'number' then
+			return divider(a, b, true)
+		elseif type(b) == 'number' then
+			return divider(b, a)
+		end
+
+		-- Adding matrices
+
+		-- Check that we have the same size
+		if a:columns() ~= b:columns() or
+			a:rows() ~= b:rows()
+		then
+			return nil
+		end
+
+		local out = matrix:new(a:columns(), a:rows())
+
+		for i=1, a:columns() do
+			for j=1, a:rows() do
+				if b:index(i, j) == 0 then
+					return nil
+				else
+					out:insert(a:index(i, j) / b:index(i, j), i, j)
+				end
+			end
+		end
+
+		return out
+	end
+
+	matrix.dot = function(a, b)
+		-- Ensure we have the right shape
+		if a:columns() ~= b:rows() then
+			return nil
+		end
+
+		local out = matrix:new(a:rows(), b:columns())
+
+		for i=1, a:rows() do
+			for j = 1, b:columns() do
+				local tmp = 0
+				for k = 1, a:columns() do
+					tmp = tmp + a:index(k, i) * b:index(j, k)
+				end
+				out:insert(tmp, j, i)
+			end
+		end
+
+		return out
+	end
+
+	-- matrix.reshape
+	matrix.reshape = function(self, columns, rows)
+		if columns * rows == self:columns() * self:rows() then
+			self._col = columns
+			self._row = rows
+			return true
+		else
+			return nil
+		end
+	end
+
+	local meta = getmetatable(matrix) or {}
+	meta.__type = "library"
+	meta.__call = matrix.constructor
+
+	setmetatable(matrix, meta)
+end
+
 local open_math = function(root)
 	local r = root
 
@@ -2065,6 +2387,9 @@ local open_math = function(root)
 	-- TODO: math.matrix
 	-- Probably require modifying our default iterators to accept
 	-- matrices as well.
+	r['math']['matrix'] = {}
+	local matrix = r['math']['matrix']
+	open_matrix(matrix)
 
 	-- Math functions
 	r['math']['mod'] = math.fmod
