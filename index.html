@@ -48,7 +48,7 @@ local luaj_print = function(...)
 	end
 end
 
-document:getElementById("code"):addEventListener("input", function()
+local update = function()
 	document:getElementById("output").innerText = '...';
 
 	-- TODO: Make it so newlines work correctly...
@@ -72,15 +72,8 @@ document:getElementById("code"):addEventListener("input", function()
 			end
 		end
 	end
-
-end)
-
-local env = luaj._make_env("webrepl")
-env.print = luaj_print
-
-local func, err = luaj.load("return 1 + 2", "luaj_code", nil, env)
-if err ~= nil then
-	print(err .. '\n')
 end
-print(func())
+
+document:getElementById("code"):addEventListener("input", update)
+update()
 </script>
