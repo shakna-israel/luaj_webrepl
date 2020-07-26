@@ -5,11 +5,28 @@ local unpack = unpack or table.unpack
 
 local load_source = nil
 
-local luaj_version = {0,5,0,'alpha'}
+local luaj_version = {0,5,0,'beta'}
 
 local version = function()
 	local idx = _VERSION:find(" ") + 1
 	return _VERSION:sub(idx, #_VERSION)
+end
+
+-- If this isn't part of the host Lua,
+-- add it in a way that is somewhat accurate.
+if math.type == nil then
+	math.type = function(x)
+		if type(x) ~= 'number' then
+			return nil
+		end
+
+		local i, f = math.modf(x)
+		if 0 == f then
+			return 'integer'
+		else
+			return 'float'
+		end
+	end
 end
 
 local is_sequence
@@ -1369,15 +1386,213 @@ local open_base64 = function(root)
 	return root
 end
 
+local open_json = function(root)
+	root['json'] = {}
+	local json = root['json']
+
+	-- Original: https://gist.github.com/tylerneylon/59f4bcf316be525b30ab
+	-- Originally released to public domain
+
+	-- Internal functions.
+
+	local function kind_of(obj)
+	  if type(obj) ~= 'table' then return type(obj) end
+	  local i = 1
+	  for _ in pairs(obj) do
+	    if obj[i] ~= nil then i = i + 1 else return 'table' end
+	  end
+	  if i == 1 then return 'table' else return 'array' end
+	end
+
+	local function escape_str(s)
+	  local in_char  = {'\\', '"', '/', '\b', '\f', '\n', '\r', '\t'}
+	  local out_char = {'\\', '"', '/',  'b',  'f',  'n',  'r',  't'}
+	  for i, c in ipairs(in_char) do
+	    s = s:gsub(c, '\\' .. out_char[i])
+	  end
+	  return s
+	end
+
+	-- Returns pos, did_find; there are two cases:
+	-- 1. Delimiter found: pos = pos after leading space + delim; did_find = true.
+	-- 2. Delimiter not found: pos = pos after leading space;     did_find = false.
+	-- This throws an error if err_if_missing is true and the delim is not found.
+	local function skip_delim(str, pos, delim, err_if_missing)
+	  pos = pos + #str:match('^%s*', pos)
+	  if str:sub(pos, pos) ~= delim then
+	    if err_if_missing then
+	      return nil, 'Expected ' .. delim .. ' near position ' .. pos
+	    end
+	    return pos, false
+	  end
+	  return pos + 1, true
+	end
+
+	-- Expects the given pos to be the first character after the opening quote.
+	-- Returns val, pos; the returned pos is after the closing quote character.
+	local function parse_str_val(str, pos, val)
+	  val = val or ''
+	  local early_end_error = 'End of input found while parsing string.'
+	  if pos > #str then
+	  	return nil, early_end_error
+	  end
+	  local c = str:sub(pos, pos)
+	  if c == '"'  then return val, pos + 1 end
+	  if c ~= '\\' then return parse_str_val(str, pos + 1, val .. c) end
+	  -- We must have a \ character.
+	  local esc_map = {b = '\b', f = '\f', n = '\n', r = '\r', t = '\t'}
+	  local nextc = str:sub(pos + 1, pos + 1)
+	  if not nextc then
+	  	return nil, early_end_error
+	  end
+	  return parse_str_val(str, pos + 2, val .. (esc_map[nextc] or nextc))
+	end
+
+	-- Returns val, pos; the returned pos is after the number's final character.
+	local function parse_num_val(str, pos)
+	  local num_str = str:match('^-?%d+%.?%d*[eE]?[+-]?%d*', pos)
+	  local val = tonumber(num_str)
+	  if not val then
+	  	return nil, 'Error parsing number at position ' .. pos .. '.'
+	  end
+	  return val, pos + #num_str
+	end
+
+
+	-- Public values and functions.
+
+	function json.stringify(obj, as_key)
+	  local s = {}  -- We'll build the string as an array of strings to be concatenated.
+	  local kind = kind_of(obj)  -- This is 'array' if it's an array or type(obj) otherwise.
+
+	  if obj == json.null then
+	  	return 'null'
+	  elseif kind == 'array' then
+	    if as_key then
+	    	return nil, 'Can\'t encode array as key.'
+	    end
+	    s[#s + 1] = '['
+	    for i, val in ipairs(obj) do
+	      if i > 1 then s[#s + 1] = ', ' end
+	      s[#s + 1] = json.stringify(val)
+	    end
+	    s[#s + 1] = ']'
+	  elseif kind == 'table' then
+	    if as_key then
+	    	return nil, 'Can\'t encode table as key.'
+	    end
+	    s[#s + 1] = '{'
+	    for k, v in pairs(obj) do
+	      if #s > 1 then s[#s + 1] = ', ' end
+	      s[#s + 1] = json.stringify(k, true)
+	      s[#s + 1] = ':'
+	      s[#s + 1] = json.stringify(v)
+	    end
+	    s[#s + 1] = '}'
+	  elseif kind == 'string' then
+	    return '"' .. escape_str(obj) .. '"'
+	  elseif kind == 'number' then
+	    if as_key then return '"' .. tostring(obj) .. '"' end
+	    return tostring(obj)
+	  elseif kind == 'boolean' then
+	    return tostring(obj)
+	  elseif kind == 'nil' then
+	    return 'null'
+	  else
+	    return nil, 'Unjsonifiable type: ' .. kind .. '.'
+	  end
+	  return table.concat(s)
+	end
+
+	json.null = {}  -- This is a one-off table to represent the null value.
+
+	function json.parse(str, pos, end_delim)
+	  pos = pos or 1
+	  if pos > #str then
+	  	return nil, 'Reached unexpected end of input.'
+	  end
+	  local pos = pos + #str:match('^%s*', pos)  -- Skip whitespace.
+	  local first = str:sub(pos, pos)
+	  if first == '{' then  -- Parse an object.
+	    local obj, key, delim_found = {}, true, true
+	    pos = pos + 1
+	    while true do
+	      key, pos = json.parse(str, pos, '}')
+	      if key == nil then
+	      	-- Error handling
+	      	if type(pos) == 'string' then
+	      		return nil, pos
+	      	else
+	      		return obj, pos
+	      	end
+	      end
+	      if not delim_found then
+	      	return nil, 'Comma missing between object items.'
+	      end
+	      pos, err = skip_delim(str, pos, ':', true)  -- true -> error if missing.
+	      -- Error handling
+	      if pos == nil then
+	      	return nil, err
+	      end
+	      obj[key], pos = json.parse(str, pos)
+	      pos, delim_found = skip_delim(str, pos, ',')
+	      -- Error handling
+	      if pos == nil then
+	      	return nil, delim_found
+	      end
+	    end
+	  elseif first == '[' then  -- Parse an array.
+	    local arr, val, delim_found = {}, true, true
+	    pos = pos + 1
+	    while true do
+	      val, pos = json.parse(str, pos, ']')
+	      if val == nil then return arr, pos end
+	      if not delim_found then
+	      	return nil, 'Comma missing between array items.'
+	      end
+	      arr[#arr + 1] = val
+	      pos, delim_found = skip_delim(str, pos, ',')
+	      -- Error handling
+	      if pos == nil then
+	      	return nil, delim_found
+	      end
+	    end
+	  elseif first == '"' then  -- Parse a string.
+	    return parse_str_val(str, pos + 1)
+	  elseif first == '-' or first:match('%d') then  -- Parse a number.
+	    return parse_num_val(str, pos)
+	  elseif first == end_delim then  -- End of an object or array.
+	    return nil, pos + 1
+	  else  -- Parse true, false, or null.
+	    local literals = {['true'] = true, ['false'] = false, ['null'] = json.null}
+	    for lit_str, lit_val in pairs(literals) do
+	      local lit_end = pos + #lit_str - 1
+	      if str:sub(pos, lit_end) == lit_str then return lit_val, lit_end + 1 end
+	    end
+	    local pos_info_str = 'position ' .. pos .. ': ' .. str:sub(pos, pos + 10)
+	    return nil, 'Invalid json syntax starting at ' .. pos_info_str
+	  end
+	end
+
+	local meta = getmetatable(root['json']) or {}
+	meta.__type = "library"
+	setmetatable(root['json'], meta)
+
+	return root
+end
+
 -- TODO: Help library
--- TODO: JSON library
 -- TODO: BigNum library
 
 -- TODO: Hash library
 -- jenkins/adler/fletcher implemented in https://git.sr.ht/~shakna/cnoevil3/tree/master/include/evil_hash.h
+-- Luhn hash: https://github.com/aiq/luazdf/blob/master/algo/luhn/luhn.lua
 
 -- TODO: TOML library
+
 -- TODO: Parser Library
+-- See https://github.com/pocomane/luasnip/blob/master/src/pegcore.lua
+
 -- TODO: Datalog library
 
 local open_uuid = function(root)
@@ -1655,6 +1870,30 @@ local open_utf8 = function(root)
 	-- UTF8 Library
 	r['utf8'] = {}
 
+	r['utf8']['create'] = function(source)
+		local ret = {}
+
+		ret._content = source
+
+		local meta = getmetatable(ret) or {}
+		meta.__type = 'utf8'
+		meta.__index = function(self, key)
+			if r['utf8'][key] ~= nil then
+				return function(self, ...)
+					local args = {...}
+					return r['utf8'][key](self._content, unpack(args))
+				end
+			end
+		end
+		meta.__tostring = function(self)
+			return self._content
+		end
+
+		setmetatable(ret, meta)
+
+		return ret
+	end
+
 	-- UTF8 Constants
 	r['utf8']['constant'] = {}
 	r['utf8']['constant']['single_sequence'] = utf8.charpattern
@@ -1667,6 +1906,9 @@ local open_utf8 = function(root)
 
 	local meta = getmetatable(r['utf8']) or {}
 	meta.__type = "library"
+	meta.__call = function(self, value)
+		return r['utf8']['create'](value)
+	end
 	setmetatable(r['utf8'], meta)
 
 	return r
@@ -1675,13 +1917,16 @@ end
 local open_bitop = function(root)
 	local r = root
 
+	-- TODO: Luajit's "bit" library compatibility shim.
+
+	-- TODO: We should have a plain-Lua fallback too.
+
 	if bit32 == nil then
 		r['bitop'] = {}
 		return r
 	end
 
 	-- Bit Operations Library
-	-- TODO: Some of the names could be clearer.
 	r['bitop'] = {}
 	r['bitop']['extract'] = bit32.extract
 	r['bitop']['and0'] = bit32.btest
@@ -1742,6 +1987,10 @@ local open_time = function(root)
 	r['time']['clock'] = os.clock
 	r['time']['diff'] = os.difftime
 
+	-- TODO: There's some useful calendar functions
+	-- @ https://github.com/aiq/luazdf/tree/master/cal
+	-- that we could reimplement.
+
 	local meta = getmetatable(r['time']) or {}
 	meta.__type = "library"
 	setmetatable(r['time'], meta)
@@ -1800,6 +2049,93 @@ local open_string = function(root)
 	r['string']['match'] = string.match
 	r['string']['fill'] = string.rep
 	r['string']['match_all'] = string.gmatch
+
+	r['string']['to_hex'] = function(source)
+		local val, _ = string.gsub(source, ".", function(c)
+    		return string.format("%02X", string.byte(c))
+  		end)
+  		return val
+	end
+	r['string']['from_hex'] = function(source)
+		local val, _ = string.gsub(source, "..?", function(h)
+    		return string.char(tonumber(h, 16))
+  		end)
+  		return val
+	end
+
+	r['string']['hamming'] = function(a, b)
+		if #a ~= #b then
+			return nil
+		end
+
+		local distance = 0
+		for i=1, #a do
+			if string.byte(a, i) ~= string.byte(b, i) then
+				distance = distance + 1
+			end
+		end
+
+		return distance
+	end
+
+	r['string']['starts_with'] = function(source, prefix)
+		if type(prefix) == 'string' then
+			return string.sub(source, 1, string.len(prefix)) == prefix
+		elseif type(prefix) == 'table' then
+			for i=1, #prefix do
+				if string.sub(source, 1, string.len(prefix[i])) == prefix[i] then
+					return true
+				end
+			end
+			return false
+		end
+	end
+
+	r['string']['ends_with'] = function(source, suffix)
+		if type(suffix) == 'string' then
+			return string.sub(source, -string.len(suffix)) == suffix
+		elseif type(suffix) == 'table' then
+			for i=1, #suffix do
+				if string.sub(source, -string.len(suffix[i])) == suffix[i] then
+					return true
+				end
+			end
+			return false
+		end
+	end
+
+	r['string']['explode'] = function(source)
+		local ret = {}
+		for i=1, #source do
+			ret[i] = string.sub(source, i, i)
+		end
+
+		return ret
+	end
+
+	r['string']['title'] = function(source)
+		local val, _ = string.gsub(source, "(%s)(%a)", function(w, c)
+    		return w .. string.upper(c)
+  		end)
+  		local first = string.upper(string.sub(val, 1, 1))
+  		return first .. string.sub(val, 2)
+	end
+
+	r['string']['snake'] = function(source)
+		local val, _ = string.gsub(string.lower(source), "%s(%a)", function(c)
+    		return '_' .. string.lower(c)
+  		end)
+  		local first = string.lower(string.sub(val, 1, 1))
+  		return first .. string.sub(val, 2)
+	end
+
+	r['string']['camel'] = function(source)
+		local val, _ = string.gsub(string.lower(source), "%s(%a)", function(c)
+    		return string.upper(c)
+  		end)
+  		local first = string.lower(string.sub(val, 1, 1))
+  		return first .. string.sub(val, 2)
+	end
 
 	local meta = getmetatable(r['string']) or {}
 	meta.__type = "library"
@@ -2383,6 +2719,7 @@ local open_math = function(root)
 	r['math']['constant']['mininteger'] = math.mininteger
 	r['math']['constant']['huge'] = math.huge
 	r['math']['constant']['pi'] = math.pi
+	r['math']['constant']['nan'] = 0/0
 
 	-- TODO: math.matrix
 	-- Probably require modifying our default iterators to accept
@@ -2419,6 +2756,73 @@ local open_math = function(root)
 	r['math']['modf'] = math.modf
 	r['math']['type'] = math.type
 
+	r['math']['round'] = {}
+	r['math']['round']['up'] = function(x, n)
+		if n == nil then
+			n = 0
+		end
+
+		if x > 0 then
+			return math.ceil(x * math.pow(10, n)) / math.pow(10, n)
+		else
+			return math.floor(x * math.pow( 10, n)) / math.pow(10, n)
+		end
+	end
+
+	r['math']['round']['down'] = function(x, n)
+		if n == nil then
+			n = 0
+		end
+
+		if x > 0 then
+			return math.floor(x * math.pow(10, n)) / math.pow(10, n)
+		else
+			return math.ceil(x * math.pow(10, n)) / math.pow(10, n)
+		end
+	end
+
+	r['math']['is_nan'] = function(x)
+		return x ~= x
+	end
+
+	r['math']['is_infinite'] = function(x)
+		return x == math.huge or x == -math.huge
+	end
+
+	r['math']['is_finite'] = function(x)
+		return x > -math.huge and x < math.huge
+	end
+
+	r['math']['cosecant'] = function(x)
+		return 1 / math.sin(x)
+	end
+
+	r['math']['clamp'] = function(x, n, y)
+		local t = {x, n, y}
+		table.sort(t)
+		return t[2]
+	end
+
+	r['math']['is_even'] = function(x)
+		if x == 0 then
+			return false
+		end
+		return math.fmod(x, 2) == 0
+	end
+
+	r['math']['is_odd'] = function(x)
+		if x == 0 then
+			return false
+		end
+		return math.fmod(x, 2) ~= 0
+	end
+
+	r['math']['in_range'] = function(x, min, max)
+		return x >= min and x <= max
+	end
+
+	-- TODO: Convert to Roman numerals?
+
 	local meta = getmetatable(r['math']) or {}
 	meta.__type = "library"
 	setmetatable(r['math'], meta)
@@ -2438,7 +2842,27 @@ local make_env = function(identifier)
 		return io.stdout:write(string.format(...))
 	end
 
-	-- TODO: deepcopy
+	r['deepcopy'] = function(orig, copies)
+	    copies = copies or {}
+	    local orig_type = type(orig)
+	    local copy
+	    if orig_type == 'table' then
+	        if copies[orig] then
+	            copy = copies[orig]
+	        else
+	            copy = {}
+	            copies[orig] = copy
+	            for orig_key, orig_value in next, orig, nil do
+	                copy[r['deepcopy'](orig_key, copies)] = r['deepcopy'](orig_value, copies)
+	            end
+	            setmetatable(copy, r['deepcopy'](getmetatable(orig), copies))
+	        end
+	    else
+	        copy = orig
+	    end
+	    return copy
+	end
+
 	-- TODO: prettyprint
 	-- TODO: serialize
 	-- TODO: deserialise
@@ -2590,130 +3014,56 @@ local make_env = function(identifier)
 	local meta = getmetatable(r) or {}
 	meta.__type = "environment"
 	meta.__index = function(self, key)
-		-- Open math library on demand.
-		if key == 'math' then
+		local library_openers = {
+			math = open_math,
+			table = open_table,
+			functional = open_functional,
+			random = open_random,
+			io = open_io,
+			string = open_string,
+			struct = open_struct,
+			os = open_os,
+			time = open_time,
+			coroutine = open_coroutine,
+			bitop = open_bitop,
+			utf8 = open_utf8,
+			lua = open_lua,
+			class = open_class,
+			unittest = open_test,
+			csv = open_csv,
+			ini = open_ini,
+			contract = open_contract,
+			base64 = open_base64,
+			cli = open_cli,
+			uuid = open_uuid,
+			json = open_json,
+		}
+
+		local stdlib = function(root)
+			root['stdlib'] = {}
+			local lib = root['stdlib']
+
+			lib['builtins'] = root['builtins']
+
+			for key, opener in pairs(library_openers) do
+				lib[key] = opener({})[key]
+			end
+
+			local builtin_meta = getmetatable(lib) or {}
+			builtin_meta.__type = "library"
+			setmetatable(lib, builtin_meta)
+
+			return root
+		end
+
+		if library_openers[key] ~= nil then
 			if rawget(self, key) == nil then
-				return open_math(self)[key]
+				return library_openers[key](self)[key]
 			end
 			return rawget(self, key)
-		-- Open table library on demand.
-		elseif key == 'table' then
+		elseif key == 'stdlib' then
 			if rawget(self, key) == nil then
-				return open_table(self)[key]
-			end
-			return rawget(self, key)
-		-- Open functional library on demand.
-		elseif key == 'functional' then
-			if rawget(self, key) == nil then
-				return open_functional(self)[key]
-			end
-			return rawget(self, key)
-		-- Open random library on demand.
-		elseif key == 'random' then
-			if rawget(self, key) == nil then
-				return open_random(self)[key]
-			end
-			return rawget(self, key)
-		-- Open I/O library on demand.
-		elseif key == 'io' then
-			if rawget(self, key) == nil then
-				return open_io(self)[key]
-			end
-			return rawget(self, key)
-		-- Open string library on demand.
-		elseif key == 'string' then
-			if rawget(self, key) == nil then
-				return open_string(self)[key]
-			end
-			return rawget(self, key)
-		-- Open struct library on demand.
-		elseif key == 'struct' then
-			if rawget(self, key) == nil then
-				return open_struct(self)[key]
-			end
-			return rawget(self, key)
-		-- Open os library on demand.
-		elseif key == 'os' then
-			if rawget(self, key) == nil then
-				return open_os(self)[key]
-			end
-			return rawget(self, key)
-		-- Open time library on demand.
-		elseif key == 'time' then
-			if rawget(self, key) == nil then
-				return open_time(self)[key]
-			end
-			return rawget(self, key)
-		-- Open coroutine library on demand.
-		elseif key == 'coroutine' then
-			if rawget(self, key) == nil then
-				return open_coroutine(self)[key]
-			end
-			return rawget(self, key)
-		-- Open bitop library on demand.
-		elseif key == 'bitop' then
-			if rawget(self, key) == nil then
-				return open_bitop(self)[key]
-			end
-			return rawget(self, key)
-		-- Open utf8 library on demand.
-		elseif key == 'utf8' then
-			if rawget(self, key) == nil then
-				return open_utf8(self)[key]
-			end
-			return rawget(self, key)
-		-- Open lua library on demand.
-		elseif key == 'lua' then
-			if rawget(self, key) == nil then
-				return open_lua(self)[key]
-			end
-			return rawget(self, key)
-		-- Open class library on demand.
-		elseif key == 'class' then
-			if rawget(self, key) == nil then
-				return open_class(self)[key]
-			end
-			return rawget(self, key)
-		-- Open unittest library on demand.
-		elseif key == 'unittest' then
-			if rawget(self, key) == nil then
-				return open_test(self)[key]
-			end
-			return rawget(self, key)
-		-- Open csv library on demand.
-		elseif key == 'csv' then
-			if rawget(self, key) == nil then
-				return open_csv(self)[key]
-			end
-			return rawget(self, key)
-		-- Open ini library on demand.
-		elseif key == 'ini' then
-			if rawget(self, key) == nil then
-				return open_ini(self)[key]
-			end
-			return rawget(self, key)
-		-- Open contract library on demand.
-		elseif key == 'contract' then
-			if rawget(self, key) == nil then
-				return open_contract(self)[key]
-			end
-			return rawget(self, key)
-		-- Open base64 library on demand.
-		elseif key == 'base64' then
-			if rawget(self, key) == nil then
-				return open_base64(self)[key]
-			end
-			return rawget(self, key)
-		-- Open cli library on demand.
-		elseif key == 'cli' then
-			if rawget(self, key) == nil then
-				return open_cli(self)[key]
-			end
-			return rawget(self, key)
-		-- Open UUID library on demand.
-		elseif key == 'uuid' then
-			if rawget(self, key) == nil then
-				return open_uuid(self)[key]
+				return stdlib(self)[key]
 			end
 			return rawget(self, key)
 		else
@@ -2906,6 +3256,9 @@ if debug.getinfo(3) == nil then
 			os.exit(1)
 		end
 	end
+
+	cli_env = nil
+	arg_parser = nil
 
 	if data.version then
 		print(string.format("Luaj %s", table.concat(luaj_version, '.')))
