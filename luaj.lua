@@ -5,7 +5,7 @@ local unpack = unpack or table.unpack
 
 local load_source = nil
 
-local luaj_version = {0,5,0,'beta'}
+local luaj_version = {0,6,0,'beta'}
 
 local version = function()
 	local idx = _VERSION:find(" ") + 1
@@ -72,10 +72,55 @@ local table_reverse = function(tbl)
     return newTable
 end
 
+local string_explode = function(source)
+	local ret = {}
+	for i=1, #source do
+		ret[i] = string.sub(source, i, i)
+	end
+
+	return ret
+end
+
+local utf8_explode = function(x)
+	local ret = {}
+
+	for uchar in string.gmatch(x, utf8.charpattern) do
+		ret[#ret+1] = uchar
+	end
+
+	return ret
+end
+
+local matrix_index = function(self, column, row)
+	local c = column - 1
+	local r = row - 1
+
+	return self._mtx[c + r * self._col + 1]
+end
+
 local iter = function(tbl, options)
 	-- Takes an options table instead of sorter:
 	-- options.sorter or '<'
 	-- options.reverse or false
+
+	local meta = getmetatable(tbl)
+
+	-- Allow iterating over strings as well...
+	if type(tbl) == 'string' then
+		tbl = string_explode(tbl)
+	-- Allow iterating over UTF8 strings as well...
+	elseif meta ~= nil and meta.__type == 'utf8' then
+		tbl = tbl:explode()
+	-- Allow iterating over a matrix as well...
+	elseif meta ~= nil and meta.__type == 'matrix' then
+		local tmp = {}
+		for r=1, tbl._row do
+			for c=1, tbl._col do
+				tmp[#tmp + 1] = {column = c, row = r, value = matrix_index(tbl, c, r)}
+			end
+		end
+		tbl = tmp
+	end
 
 	if options == nil then
 		options = {}
@@ -1864,6 +1909,11 @@ local open_lua = function(root)
 	return root
 end
 
+-- Has to be here, for "exact same metamethod", otherwise __eq not called.
+local utf8_equal = function(a, b)
+	return tostring(a) == tostring(b)
+end
+
 local open_utf8 = function(root)
 	local r = root
 
@@ -1884,9 +1934,28 @@ local open_utf8 = function(root)
 					return r['utf8'][key](self._content, unpack(args))
 				end
 			end
+			if r['string'][key] ~= nil then
+				return function(self, ...)
+					local args = {...}
+					local v = {r['string'][key](self._content, unpack(args))}
+					for i=1, #v do
+						if type(v[i]) == 'string' then
+							v[i] = r['utf8']['create'](v[i])
+						end
+					end
+					return unpack(v)
+				end
+			end
 		end
 		meta.__tostring = function(self)
 			return self._content
+		end
+		meta.__eq = utf8_equal
+		meta.__len = function(self)
+			return utf8.len(self._content)
+		end
+		meta.__call = function(tbl, ...)
+			return r['utf8']['substring'](tbl._content, ...)
 		end
 
 		setmetatable(ret, meta)
@@ -1904,10 +1973,89 @@ local open_utf8 = function(root)
 	r['utf8']['iter'] = utf8.codes
 	r['utf8']['char'] = utf8.char
 
+	r['utf8']['explode'] = function(...)
+		local x = utf8_explode(...)
+		for i=1, #x do
+			x[i] = r['utf8']['create'](x[i])
+		end
+		return x
+	end
+
+	r['utf8']['reverse'] = function(x)
+		local tmp = utf8_explode(x)
+		local tmp2 = {}
+		for i = #tmp, 1, -1 do
+			tmp2[#tmp2 + 1] = tostring(tmp[i])
+		end
+		return r['utf8']['create'](table.concat(tmp2))
+	end
+
+	r['utf8']['substring'] = function(source, start, finish)
+		local ret = {}
+
+		if start == nil then
+			start = 1
+		end
+		if finish == nil then
+			finish = utf8.len(source)
+		end
+		if finish < 0 then
+			finish = utf8.len(source) - finish
+		end
+
+		local i = 1
+		for uchar in string.gmatch(source, utf8.charpattern) do
+			if i > finish then
+				break
+			end
+
+			if i >= start and i <= finish then
+				ret[#ret+1] = uchar
+			end
+
+			i = i + 1
+		end
+
+		return r['utf8']['create'](table.concat(ret))
+	end
+
+	r['utf8']['hamming'] = function(a, b)
+		if #a ~= #b then
+			return nil
+		end
+
+		a = tostring(a)
+		b = tostring(b)
+
+		local distance = 0
+		for i=1, #a do
+			if string.byte(a, i) ~= string.byte(b, i) then
+				distance = distance + 1
+			end
+		end
+
+		return distance
+	end
+
 	local meta = getmetatable(r['utf8']) or {}
 	meta.__type = "library"
 	meta.__call = function(self, value)
-		return r['utf8']['create'](value)
+		return self['create'](value)
+	end
+	meta.__index = function(self, key)
+		if rawget(self, key) then
+			return rawget(self, key)
+		else
+			return function(...)
+				local v = {r['string'][key](...)}
+				for i=1, #v do
+					if type(v[i]) == 'string' then
+						v[i] = r['utf8']['create'](v[i])
+					end
+				end
+				return unpack(v)
+			end
+		end
 	end
 	setmetatable(r['utf8'], meta)
 
@@ -2104,14 +2252,7 @@ local open_string = function(root)
 		end
 	end
 
-	r['string']['explode'] = function(source)
-		local ret = {}
-		for i=1, #source do
-			ret[i] = string.sub(source, i, i)
-		end
-
-		return ret
-	end
+	r['string']['explode'] = string_explode
 
 	r['string']['title'] = function(source)
 		local val, _ = string.gsub(source, "(%s)(%a)", function(w, c)
@@ -2443,12 +2584,7 @@ local open_matrix = function(matrix)
 		return self._row
 	end
 
-	matrix.index = function(self, column, row)
-		local c = column - 1
-		local r = row - 1
-
-		return self._mtx[c + r * self._col + 1]
-	end
+	matrix.index = matrix_index
 
 	matrix.insert = function(self, value, column, row)
 		local c = column - 1
@@ -2721,9 +2857,6 @@ local open_math = function(root)
 	r['math']['constant']['pi'] = math.pi
 	r['math']['constant']['nan'] = 0/0
 
-	-- TODO: math.matrix
-	-- Probably require modifying our default iterators to accept
-	-- matrices as well.
 	r['math']['matrix'] = {}
 	local matrix = r['math']['matrix']
 	open_matrix(matrix)
@@ -2821,7 +2954,7 @@ local open_math = function(root)
 		return x >= min and x <= max
 	end
 
-	-- TODO: Convert to Roman numerals?
+	-- TODO: Convert to Roman numerals? And back to Arabic?
 
 	local meta = getmetatable(r['math']) or {}
 	meta.__type = "library"
