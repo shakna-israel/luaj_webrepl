@@ -4,12 +4,36 @@ local load = loadstring or load
 local unpack = unpack or table.unpack
 
 local load_source = nil
+local make_env = nil
 
-local luaj_version = {0,6,0,'beta'}
+local luaj_version = {0,7,0,'beta'}
 
 local version = function()
 	local idx = _VERSION:find(" ") + 1
 	return _VERSION:sub(idx, #_VERSION)
+end
+
+local luaj_next = function(t, key)
+	local m = getmetatable(t)
+	local n = m and m.__next or next
+	return n(t,key)
+end
+-- Have pairs be aware of __next
+local luaj_pairs = function(t) return luaj_next, t, nil end
+
+-- Have ipairs be aware of __index
+local _ipairs = function(t, var)
+  var = var + 1
+  local value = t[var]
+  if value == nil then return end
+  return var, value
+end
+local luaj_ipairs = function(t)
+	if t[0] ~= nil then
+		return _ipairs, t, -1
+	else
+		return _ipairs, t, 0
+	end
 end
 
 -- If this isn't part of the host Lua,
@@ -134,7 +158,7 @@ local iter = function(tbl, options)
 	end
 
 	local keys = {}
-	for k, _ in pairs(tbl) do
+	for k, _ in luaj_pairs(tbl) do
 		keys[#keys + 1] = k
 	end
 	table.sort(keys, sorter)
@@ -180,7 +204,7 @@ local value_iterator = function(tbl, options)
 		end
 
 	else
-		return ipairs(tbl)
+		return luaj_ipairs(tbl)
 	end
 end
 
@@ -823,7 +847,10 @@ local open_contract = function(root)
 
 	-- Contract enforcer
 	contract.assert = function(bool, msg)
-		assert(bool, msg)
+		if not bool then
+			-- Raise the error where the contract'd function is called.
+			error(msg, 3)
+		end
 	end
 
 	-- Constructor for a generic Nil or particular Type
@@ -947,23 +974,43 @@ local open_contract = function(root)
 		return function(...)
 
 			local args = {...}
-			for idx, value in ipairs(args) do
-				local ass = contract.assert(contract.match_type(value, arg_types[idx]),
+			local ass = contract.assert(#args == #arg_types,
+				string.format("Received <%d> arguments, but expected <%d> arguments.", #args, #arg_types))
+			if ass ~= nil then
+				return ass
+			end
+
+			for idx, arg_type in ipairs(arg_types) do
+				local ass = contract.assert(contract.match_type(args[idx], arg_type),
 					string.format("For argument <%d>, expected an argument type of: <%s>, but received <%s>",
-						idx, arg_types[idx], luaj_type(value)))
+						idx, arg_type, luaj_type(args[idx])))
 				if ass ~= nil then
 					return ass
 				end
 			end
 
-			local r = functor(...)
-			local ass = contract.assert(contract.match_type(r, return_type),
-				string.format("Expected a return type of: <%s>, but received <%s>",
-					return_type, luaj_type(r)))
+			-- Package for single return
+			if type(return_type) ~= 'table' then
+				return_type = {return_type}
+			end
+
+			local r = {functor(...)}
+			local ass = contract.assert(not (#r > #return_type),
+				string.format("Received <%d> return values, but expected <%d> return values.", #r, #return_type))
 			if ass ~= nil then
 				return ass
 			end
-			return r
+
+			for idx, arg_type in ipairs(return_type) do
+				local ass = contract.assert(contract.match_type(r[idx], arg_type),
+					string.format("For return value <%d>, expected a value type of: <%s>, but received <%s>",
+						idx, arg_type, luaj_type(r[idx])))
+				if ass ~= nil then
+					return ass
+				end
+			end
+
+			return unpack(r)
 		end
 	end
 
@@ -1172,9 +1219,11 @@ local open_csv = function(root)
 
 				if type(row[key]) == 'number' then
 					if math.type(row[key]) == 'integer' then
-						x[#x+1] = string.format("%d", row[key])
+						-- %d can _rarely_ result in oddness.
+						x[#x+1] = string.format("%.0f", row[key])
 					else
-						local float_rep = string.format("%f", row[key])
+						-- 0.16f seems to be Lua 5.3's limit.
+						local float_rep = string.format("%.16f", row[key])
 						x[#x+1] = string.gsub(float_rep, "%.?0+$", "")
 					end
 				elseif row[key] == nil then
@@ -2155,6 +2204,10 @@ local open_os = function(root)
 	r['os']['setlocale'] = os.setlocale
 	r['os']['env'] = os.getenv
 
+	-- TODO: whoami
+	-- TODO: hostname
+	-- TODO: os name
+
 	local meta = getmetatable(r['os']) or {}
 	meta.__type = "library"
 	setmetatable(r['os'], meta)
@@ -2490,9 +2543,37 @@ local open_table = function(root)
 	local r = root
 
 	r['table'] = {}
-	r['table']['move'] = table.move
-	r['table']['remove'] = table.remove
-	r['table']['insert'] = table.insert
+
+	r['table']['move'] = function(...)
+		local args = {...}
+		local meta = getmetatable(args[1])
+		if meta and meta.__readonly then
+			error("Can't move from a read only table!", 2)
+		end
+		meta = getmetatable(args[#args])
+		if meta and meta.__readonly then
+			error("Can't move to a read only table!", 2)
+		end
+
+		return table.move(...)
+	end
+
+	r['table']['remove'] = function(tbl, ...)
+		local meta = getmetatable(tbl)
+		if meta and meta.__readonly then
+			error("Can't remove from a read only table!", 2)
+		end
+		return table.remove(tbl, ...)
+	end
+	
+	r['table']['insert'] = function(tbl, ...)
+		local meta = getmetatable(tbl)
+		if meta and meta.__readonly then
+			error("Can't insert into a read only table!", 2)
+		end
+		return table.insert(tbl, ...)
+	end
+
 	r['table']['invert'] = function(tbl)
 		local r = {}
 	    for k, v in pairs(tbl) do
@@ -2512,6 +2593,25 @@ local open_table = function(root)
 	  return tbl
 	end
 	r['table']['reverse'] = table_reverse
+
+	r['table']['readonly'] = function(t)
+		return setmetatable({}, {
+			__readonly = true,
+			__index = t,
+			__newindex = function(self, key, value)
+				error("Can't write to read only table.", 2)
+			end,
+			__len = function(self)
+				return #t
+			end,
+			__ipairs = function(tbl)
+				return ipairs(t)
+			end,
+			__pairs = function(tbl)
+				return pairs(t)
+			end
+		})
+	end
 
 	local meta = getmetatable(r['table']) or {}
 	meta.__type = "library"
@@ -2843,6 +2943,22 @@ local open_matrix = function(matrix)
 	setmetatable(matrix, meta)
 end
 
+local open_luaj = function(root)
+	root['luaj'] = {}
+
+	local r = root['luaj']
+
+	r['load'] = load_source
+	r['make_env'] = make_env
+
+	local meta = getmetatable(r) or {}
+	meta.__type = "library"
+
+	setmetatable(r, meta)
+
+	return root
+end
+
 local open_math = function(root)
 	local r = root
 
@@ -2963,12 +3079,12 @@ local open_math = function(root)
 	return r
 end
 
-local make_env = function(identifier)
+make_env = function(identifier)
 	local r = {}
 
 	r['_VERSION'] = table.concat(luaj_version, '.')
 
-	r['next'] = next
+	r['next'] = luaj_next
 	r['assert'] = assert
 	r['print'] = print
 	r['printf'] = function(...)
@@ -3004,7 +3120,7 @@ local make_env = function(identifier)
 	r['locals'] = get_locals
 
 	-- Iterators
-	r['items'] = pairs
+	r['items'] = luaj_pairs
 	r['values'] = value_iterator
 
 	-- Sorted pairs
@@ -3066,11 +3182,8 @@ local make_env = function(identifier)
 		-- Our custom set of paths
 		local path_sep = package.config:sub(1,1)
 		local paths = {}
-		paths[#paths + 1] = string.format("%s%s%s%s%s?.lua",
-			datapath(), "luaj", path_sep, version(), path_sep)
-		paths[#paths + 1] = string.format("%s%s%s%s%s%s%sinit.lua",
-			datapath(), "luaj", path_sep, version(), path_sep, "?", path_sep)
 
+		-- Local directory...
 		local ref_dir = nil
 		if dirname(name) == name then
 			ref_dir = '.'
@@ -3082,6 +3195,12 @@ local make_env = function(identifier)
 		paths[#paths + 1] = string.format("%s%s?.lua", ref_dir, path_sep)
 		paths[#paths + 1] = string.format("%s%s?%sinit.lua",
 			ref_dir, path_sep, path_sep)
+
+		-- Data directory paths...
+		paths[#paths + 1] = string.format("%s%s%s%s%s?.lua",
+			datapath(), "luaj", path_sep, version(), path_sep)
+		paths[#paths + 1] = string.format("%s%s%s%s%s%s%sinit.lua",
+			datapath(), "luaj", path_sep, version(), path_sep, "?", path_sep)
 
 		-- Get package paths from Lua...
 		local path_list_sep = package.config:sub(3, 3)
@@ -3133,6 +3252,72 @@ local make_env = function(identifier)
 		end
 	end
 
+	r['switch'] = function(case)
+		return function(codetable)
+			local f
+			f = codetable[case] or codetable.default
+
+			if case ~= nil then
+        		f = codetable[case] or codetable.default
+      		else
+        		f = codetable.missing or codetable.default
+      		end
+
+			if f then
+				if type(f) == 'function' then
+					return f(case)
+				else
+					return f
+				end
+			end
+		end
+	end
+
+	r['operator'] = function(f)
+		local mt = { __sub = function(self, b)
+			return f(self[1], b)
+		end}
+
+		return setmetatable({}, { __sub = function(a, _)
+			return setmetatable({ a }, mt) end
+		})
+	end
+
+	enum = setmetatable({}, {
+		__newindex = function(self, key, value)
+			error("Cannot assign to an enum.", 2)
+		end,
+		__index = function(E, k)
+			if type(k) ~= 'string' then
+				error("Cannot reference a non-string enum.", 2)
+			end
+
+			if rawget(E, k) == nil then
+				rawset(E, k, {})
+
+				local meta = {
+					__tostring = function(self)
+						return k
+					end,
+					__len = function(self)
+						return 0
+					end,
+					__lt = function(a, b)
+						return true
+					end,
+					__gt = function(a, b)
+						return true
+					end,
+					-- Semiprivate metatable!
+					__metatable = {__type = "enum"}
+				}
+				setmetatable(rawget(E, k), meta)
+			end
+			return rawget(E, k)
+		end
+	})
+	r['enum'] = enum
+
 	-- Copy to builtins
 	r['builtins'] = {}
 	for k, v in pairs(r) do
@@ -3147,6 +3332,7 @@ local make_env = function(identifier)
 	local meta = getmetatable(r) or {}
 	meta.__type = "environment"
 	meta.__index = function(self, key)
+
 		local library_openers = {
 			math = open_math,
 			table = open_table,
@@ -3170,6 +3356,7 @@ local make_env = function(identifier)
 			cli = open_cli,
 			uuid = open_uuid,
 			json = open_json,
+			luaj = open_luaj,
 		}
 
 		local stdlib = function(root)
@@ -3274,7 +3461,9 @@ load_source = function(source, identifier, lib, env)
 	]]
 	meta_header = string.gsub(meta_header, "\n", "")
 
-	local statement = string.format("%s return function(arg)\n%s end", meta_header, source .. '\n')
+	local statement = string.format("%s return function(arg) %s end", meta_header, source .. '\n')
+
+	-- TODO: We might be able to use debug hooks to add this kind of nice error messaging everywhere.
 
 	-- This only handles syntax errors...
 	local func, err = load(statement, identifier, "bt", env)
@@ -3282,13 +3471,12 @@ load_source = function(source, identifier, lib, env)
 		-- Get the first character of the error message
 		local first = string.sub(err, 1, 1)
 
+		-- Get the line the error occurred on
 		local line = 1
-
-		-- Adjust the line data to be accurate to the user's source
-		err = string.gsub(err, ":(%d+):", function(bit)
-			line = tonumber(bit) - 1
-			return ':' .. tostring(line) .. ':'
+		string.gsub(err, ":(%d+):", function(bit)
+			line = tonumber(bit)
 		end)
+		line = line - 1
 
 		-- Remove the "string" from the start of the error message
 		err = first .. string.sub(err, 9)
@@ -3312,15 +3500,30 @@ local repl = function()
 	local statement_count = 0
 
 	print(string.format("Luaj v%s", env._VERSION))
-
-	-- TODO: If Lua can find getline, we should use it. Otherwise, fall back to this behaviour.
-
 	print("Preface statements with = or return to get their value.")
 	print("Place 'q' alone on its own line to exit.")
 
+	-- If Lua can find linenoise, we should use it. Otherwise, fall back to this behaviour.
+	local L = require 'linenoise'
+	if L ~= nil then
+		-- TODO: Add completion & hints based on keywords + locals
+		-- TODO: Support history file?
+		L.enableutf8()
+	end
+
 	while true do
-		io.stdout:write("> ")
-		local source = io.stdin:read("*l")
+		local source
+		if L ~= nil then
+			local line, err = L.linenoise("> ")
+			if err then
+				io.stderr:write(string.format("Prompt Error: %s\n", err))
+				os.exit(1)
+			end
+			source = line
+		else
+			io.stdout:write("> ")
+			source = io.stdin:read("*l")
+		end
 		statement_count = statement_count + 1
 
 		-- Support the Lua REPL shorthand for return
@@ -3337,6 +3540,9 @@ local repl = function()
 		if err ~= nil then
 			io.stderr:write(err .. '\n')
 		else
+			if L ~= nil then
+				L.historyadd(source)
+			end
 
 			local d = {pcall(func)}
 			local success = table.remove(d, 1)
