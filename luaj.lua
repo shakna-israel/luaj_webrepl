@@ -5,8 +5,35 @@ local unpack = unpack or table.unpack
 
 local load_source = nil
 local make_env = nil
+local docstrings = {}
 
-local luaj_version = {0,7,0,'beta'}
+local luaj_version = {0,9,0}
+
+local gen_operator = function(f)
+	local mt = { __sub = function(self, b)
+		return f(self[1], b)
+	end}
+
+	return setmetatable({}, { __sub = function(a, _)
+		return setmetatable({ a }, mt) end,
+		__call = function(self, a, b)
+			return f(a, b)
+		end,
+		__type = "operator",
+	})
+end
+
+local callable = function(a)
+	if type(a) == 'function' then
+		return true
+	else
+		local meta = getmetatable(a)
+		if meta ~= nil then
+			return meta.__call ~= nil
+		end
+	end
+	return false
+end
 
 local version = function()
 	local idx = _VERSION:find(" ") + 1
@@ -23,10 +50,14 @@ local luaj_pairs = function(t) return luaj_next, t, nil end
 
 -- Have ipairs be aware of __index
 local _ipairs = function(t, var)
-  var = var + 1
-  local value = t[var]
-  if value == nil then return end
-  return var, value
+	var = var + 1
+	local value = t[var]
+
+	if var == #t then
+		return nil
+	end
+
+	return var, value
 end
 local luaj_ipairs = function(t)
 	if t[0] ~= nil then
@@ -493,6 +524,335 @@ local iformat = function(source, data)
 	end
 
 	return outer_interp(source, data)
+end
+
+local stackly_get_pos = function(token, line, char)
+	if #token > char then
+		return line, char
+	else
+		return line, char - math.floor(#token / 2)
+	end
+end
+
+local stackly_lex = function(source)
+	local tree = {}
+
+	local statement = {}
+	local token = {}
+	local in_string = false
+	local end_string = '"'
+	local escape_char = '\\'
+	local escaping = false
+	local char = 0
+	local line = 1
+
+	for i=1, #source do
+		local c = source:sub(i, i)
+
+		if c == '\n' then
+			line = line + 1
+			char = 0
+		else
+			char = char + 1
+		end
+
+		if in_string then
+			if c == end_string and not escaping then
+				token[#token + 1] = c
+				in_string = false
+
+				local v = table.concat(token)
+				local pline, pchar =stackly_get_pos(v, line, char)
+				statement[#statement+1] = {v, line=pline, char=pchar}
+				token = {}
+			elseif escaping then
+				if c == 'n' then
+					token[#token + 1] = '\n'
+				elseif c == 'a' then
+					token[#token + 1] = '\a'
+				elseif c == 'b' then
+					token[#token + 1] = '\b'
+				elseif c == 'f' then
+					token[#token + 1] = '\f'
+				elseif c == 'r' then
+					token[#token + 1] = '\r'
+				elseif c == 't' then
+					token[#token + 1] = '\t'
+				elseif c == 'v' then
+					token[#token + 1] = '\v'
+				else
+					token[#token + 1] = c
+				end
+				escaping = false
+			elseif c == escape_char and end_string ~= '}' then
+				escaping = true
+			else
+				token[#token + 1] = c
+			end
+		else
+			if c == '\n' then
+				if #token > 0 then
+					local v = table.concat(token)
+					local pline, pchar =stackly_get_pos(v, line, char)
+					statement[#statement+1] = {v, line=pline, char=pchar}
+					token = {}
+				end
+				if #statement > 0 then
+					for index = #statement, 1, -1 do
+						tree[#tree + 1] = statement[index]
+					end
+					statement = {}
+				end
+			elseif c == ' ' or c == '\t' then
+				if #token > 0 then
+					local v = table.concat(token)
+					local pline, pchar =stackly_get_pos(v, line, char)
+					statement[#statement+1] = {v, line=pline, char=pchar}
+					token = {}
+				end
+			elseif c == '[' or c == '"' or c == '{' then
+				if #token > 0 then
+					local v = table.concat(token)
+					local pline, pchar =stackly_get_pos(v, line, char)
+					statement[#statement+1] = {v, line=pline, char=pchar}
+					token = {}
+				end
+
+				token[#token + 1] = c
+				in_string = true
+				if c == '"' then
+					end_string = '"'
+				elseif c == '[' then
+					end_string = ']'
+				else
+					end_string = '}'
+				end
+			else
+				token[#token + 1] = c
+			end
+		end
+
+	end
+
+	if #token > 0 then
+		local v = table.concat(token)
+		local pline, pchar =stackly_get_pos(v, line, char)
+		statement[#statement+1] = {v, line=pline, char=pchar}
+		token = nil
+	end
+
+	if #statement > 0 then
+		for index = #statement, 1, -1 do
+			tree[#tree + 1] = statement[index]
+		end
+		statement = nil
+	end
+
+	return tree
+end
+
+local open_parser = function(root)
+	root['parser'] = {}
+	local lib = root['parser']
+
+	lib.encode_string = function(s)
+		s = string.gsub(s, '".-"', function(inside_string)
+			return string.gsub(inside_string, "\\(.)", function(x)
+				if x == 'a' then
+					return string.format("\\%03d", string.byte('\a'))
+				elseif x == 'b' then
+					return string.format("\\%03d", string.byte('\b'))
+				elseif x == 'f' then
+					return string.format("\\%03d", string.byte('\f'))
+				elseif x == 'n' then
+					return string.format("\\%03d", string.byte('\n'))
+				elseif x == 'r' then
+					return string.format("\\%03d", string.byte('\r'))
+				elseif x == 't' then
+					return string.format("\\%03d", string.byte('\t'))
+				elseif x == 'v' then
+					return string.format("\\%03d", string.byte('\v'))
+				else
+					return string.format("\\%03d", string.byte(x))
+				end
+			end)
+		end)
+
+		return s
+	end
+
+	lib.decode_string = function(s)
+		return (string.gsub(s, "\\(%d%d%d)", function(d)
+			return string.char(tonumber(d))
+		end))
+	end
+
+	lib.recursive_descent = function(source, lex, matches)
+		local ast = {}
+		local i_count = 1
+		for i, x in lex(source) do
+			if x ~= nil then
+				i = x
+			end
+			local found = false
+			for _, cell in ipairs(matches) do
+				if cell.predicate(i, ast) then
+					ast[#ast + 1] = cell.generator(i, ast)
+					found = true
+					break
+				end
+			end
+			if not found then
+				return nil, i, i_count
+			end
+			i_count = i_count + 1
+		end
+		return ast
+	end
+
+	lib.lex = {}
+
+	lib.lex.whitespace = function(source)
+		return string.gmatch(source, "%S+")
+	end
+
+	lib.lex.stackly = function(source)
+		local ast = stackly_lex(source)
+
+		local iterator = function(t, i)
+			local i = i + 1
+			if i > #ast then
+				return nil
+			end
+			return i, t[i][1]
+		end
+
+		return iterator, ast, 0
+	end
+
+	local whitespace_and_strings = function(source, standalone)
+		s = lib.encode_string(source)
+
+		local ast = {}
+		local token = {}
+		local instring = false
+		if standalone == nil then
+			standalone = {}
+		end
+
+		for i=1, #s do
+			local c = string.sub(s, i, i)
+			if instring then
+				if c == '"' then
+					token[#token + 1] = c
+					ast[#ast + 1] = table.concat(token)
+					token = {}
+					instring = false
+				else
+					token[#token + 1] = c
+				end
+			elseif string.match(c, "%s+") ~= nil then
+				if #token > 0 then
+					ast[#ast+1] = table.concat(token)
+					token = {}
+				end
+			elseif standalone[c] then
+				if #token > 0 then
+					ast[#ast+1] = table.concat(token)
+					token = {}
+				end
+				ast[#ast+1] = c
+			elseif c == '"' then
+				if #token > 0 then
+					ast[#ast+1] = table.concat(token)
+					token = {}
+				end
+				token[#token + 1] = c
+				instring = true
+			else
+				token[#token + 1] = c
+			end
+		end
+
+		if #token > 0 then
+			ast[#ast+1] = table.concat(token)
+		end
+
+		for i=1, #ast do
+			ast[i] = lib.decode_string(ast[i])
+		end
+
+		return ast
+	end
+
+	lib.lex.whitespace_and_strings = function(source, standalone)
+		local ast = whitespace_and_strings(source, standalone)
+
+		local iterator = function(t, i)
+			local i = i + 1
+			if i > #ast then
+				return nil
+			end
+			return i, t[i]
+		end
+
+		return iterator, ast, 0
+	end
+
+	local meta = getmetatable(lib) or {}
+	meta.__type = "library"
+	setmetatable(lib, meta)
+
+	return root
+end
+
+local open_help = function(root)
+	root['help'] = {}
+	local lib = root['help']
+
+	docstrings = setmetatable(docstrings, {__mode = "kv"})
+
+	lib.help = function(obj, message)
+		-- Set a help string
+		if message ~= nil then
+			docstrings[obj] = message
+			return obj
+		else
+		-- Get a help string
+			return docstrings[obj]
+		end
+	end
+
+	docstring_meta = {__concat =
+		function(a, f)
+			local r = function(...)
+				return f(...)
+			end
+			docstrings[r] = a[1]
+			return r
+		end
+	}
+
+	lib.doc = function(...)
+  		return setmetatable({...}, docstring_meta)
+	end
+
+	-- TODO: Document the standard utilities & libraries
+	-- when this library is exposed.
+	-- On opening a library, test (rawget) for help library existence,
+	-- if it does, add documentation with lib.help for each function.
+
+	local meta = {
+		__call = function(self, ...)
+			return lib.help(...)
+		end
+	}
+	setmetatable(lib, meta)
+
+	meta.__type = "library"
+	setmetatable(lib, meta)
+
+	return root
 end
 
 local open_cli = function(root)
@@ -1808,7 +2168,9 @@ local open_ini = function(root)
 		for idx, item in ipairs(lines) do
 			line = ini_strip(item)
 			if #line > 0 then
-				if line:sub(1,1) == '[' and line:sub(#line, #line) == ']' then
+				if line:sub(1, 1) == ';' then
+					-- A comment. Do nothing.
+				elseif line:sub(1,1) == '[' and line:sub(#line, #line) == ']' then
 					current_heading = ini_strip(line:sub(2, #line - 1))
 					r[current_heading] = {}
 				elseif line:find('=') ~= nil then
@@ -2250,6 +2612,8 @@ local open_string = function(root)
 	r['string']['match'] = string.match
 	r['string']['fill'] = string.rep
 	r['string']['match_all'] = string.gmatch
+	r['string']['format'] = string.format
+	r['string']['iformat'] = iformat
 
 	r['string']['to_hex'] = function(source)
 		local val, _ = string.gsub(source, ".", function(c)
@@ -2925,6 +3289,18 @@ local open_matrix = function(matrix)
 		return out
 	end
 
+	matrix.map = function(self, functor)
+		local out = matrix:new(self:columns(), self:rows())
+
+		for i=1, self:columns() do
+			for j=1, self:rows() do
+				out:insert(functor(self:index(i, j)), i, j)
+			end
+		end
+
+		return out
+	end
+
 	-- matrix.reshape
 	matrix.reshape = function(self, columns, rows)
 		if columns * rows == self:columns() * self:rows() then
@@ -2934,6 +3310,16 @@ local open_matrix = function(matrix)
 		else
 			return nil
 		end
+	end
+
+	matrix.flatten = function(self)
+		local out = {}
+		
+		for i=1, #self._mtx do
+			out[i] = self._mtx[i]
+		end
+
+		return out
 	end
 
 	local meta = getmetatable(matrix) or {}
@@ -2950,6 +3336,73 @@ local open_luaj = function(root)
 
 	r['load'] = load_source
 	r['make_env'] = make_env
+
+	local meta = getmetatable(r) or {}
+	meta.__type = "library"
+
+	setmetatable(r, meta)
+
+	return root
+end
+
+local open_hash = function(root)
+	root['hash'] = {}
+	local r = root['hash']
+
+	-- jenkins
+	r['jenkins'] = function(s)
+		local i = 1
+		local hash = 0
+
+		-- TODO: Remove reliance on bit32
+
+		while i < #s do
+			hash = hash + string.byte(string.sub(s, i, i))
+			i = i + 1
+			hash = hash + bit32.lshift(hash, 10)
+			hash = hash + bit32.rshift(hash, 6)
+		end
+		hash = hash + bit32.lshift(hash, 3)
+		hash = hash + bit32.bxor(hash, 3)
+		hash = hash + bit32.lshift(hash, 15)
+
+		return hash
+	end
+
+	-- adler
+	r['adler'] = function(s)
+		sa = 1
+		sb = 0
+
+		-- TODO: Remove reliance on bit32
+
+		for i = 1, #s do
+			local c = string.byte(string.sub(s, i, i))
+			sa = (sa + c) % 65521
+			sb = (sb + sa) % 65521
+		end
+
+		return bit32.bor(bit32.lshift(sb, 16), sa)
+	end
+
+	-- fletcher
+	r['fletcher'] = function(s)
+		a = 0
+		b = 0
+
+		-- TODO: Remove reliance on bit32
+
+		for i = 1, #s do
+			local c = string.byte(string.sub(s, i, i))
+			a = (a + c) % 65535
+			b = (b + a) % 65535
+		end
+
+		return bit32.bor(bit32.lshift(b, 16), a)
+	end
+
+	-- TODO: md5
+	-- TODO: sha1
 
 	local meta = getmetatable(r) or {}
 	meta.__type = "library"
@@ -2978,20 +3431,20 @@ local open_math = function(root)
 	open_matrix(matrix)
 
 	-- Math functions
-	r['math']['mod'] = math.fmod
-	r['math']['rexp'] = math.frexp
+	r['math']['mod'] = gen_operator(math.fmod)
+	r['math']['rexp'] = gen_operator(math.frexp)
 	r['math']['absolute'] = math.abs
 	r['math']['toradians'] = math.rad
 	r['math']['floor'] = math.floor
 	r['math']['todegrees'] = math.deg
-	r['math']['power'] = math.pow
+	r['math']['power'] = gen_operator(math.pow)
 	r['math']['hyperbolic_tangent'] = math.tanh
 	r['math']['arc_sine'] = math.asin
 	r['math']['ceiling'] = math.ceil
-	r['math']['logarithm'] = math.log
-	r['math']['ldexp'] = math.ldexp
+	r['math']['logarithm'] = gen_operator(math.log)
+	r['math']['ldexp'] = gen_operator(math.ldexp)
 	r['math']['exponent'] = math.exp
-	r['math']['unsigned_lt'] = math.ult
+	r['math']['unsigned_lt'] = gen_operator(math.ult)
 	r['math']['cosine'] = math.cos
 	r['math']['arc_cosine'] = math.acos
 	r['math']['tangent'] = math.tan
@@ -3006,7 +3459,7 @@ local open_math = function(root)
 	r['math']['type'] = math.type
 
 	r['math']['round'] = {}
-	r['math']['round']['up'] = function(x, n)
+	r['math']['round']['up'] = gen_operator(function(x, n)
 		if n == nil then
 			n = 0
 		end
@@ -3016,9 +3469,9 @@ local open_math = function(root)
 		else
 			return math.floor(x * math.pow( 10, n)) / math.pow(10, n)
 		end
-	end
+	end)
 
-	r['math']['round']['down'] = function(x, n)
+	r['math']['round']['down'] = gen_operator(function(x, n)
 		if n == nil then
 			n = 0
 		end
@@ -3028,7 +3481,7 @@ local open_math = function(root)
 		else
 			return math.ceil(x * math.pow(10, n)) / math.pow(10, n)
 		end
-	end
+	end)
 
 	r['math']['is_nan'] = function(x)
 		return x ~= x
@@ -3082,11 +3535,29 @@ end
 make_env = function(identifier)
 	local r = {}
 
+	local open_std_util_help = function()
+		docstrings[r['_VERSION']] = "The current Luaj version"
+		docstrings[r['next']] = "Fetch the next key/value pair from a table."
+		docstrings[r['assert']] = "assert(bool, [message]) - Raise an error message if something is not true."
+		docstrings[r['print']] = "Print a representation of object/s to the console."
+		docstrings[r['printf']] = "printf(formatter, ...) - A formatted print statement."
+		docstrings[r['deepcopy']] = "Returns a copy of an object."
+		docstrings[r['memoize']] = "Wrap a function to memoize results based on inputs."
+		docstrings[r['locals']] = "Get a table _copy_ of current local variables in scope."
+		docstrings[r['items']] = "Unordered iterator"
+		docstrings[r['values']] = "Iterator for sequences."
+		docstrings[r['iter']] = "Ordered iterator."
+		docstrings[r['tonumber']] = "tonumber(obj) - Returns nil or a coerced number value."
+		-- TODO: Other builtins.
+		-- TODO: Probably expand to more the single-liners. Any way to sync with docs?
+	end
+
 	r['_VERSION'] = table.concat(luaj_version, '.')
 
 	r['next'] = luaj_next
 	r['assert'] = assert
 	r['print'] = print
+
 	r['printf'] = function(...)
 		return io.stdout:write(string.format(...))
 	end
@@ -3273,15 +3744,16 @@ make_env = function(identifier)
 		end
 	end
 
-	r['operator'] = function(f)
-		local mt = { __sub = function(self, b)
-			return f(self[1], b)
-		end}
+	r['operator'] = gen_operator
 
-		return setmetatable({}, { __sub = function(a, _)
-			return setmetatable({ a }, mt) end
-		})
-	end
+	r['callable'] = callable
+
+	r['to'] = gen_operator(function(left, right)
+		if not callable(right) then
+			error("Type Error: Right hand value was not callable for `to`.", 2)
+		end
+		return right(left)
+	end)
 
 	enum = setmetatable({}, {
 		__newindex = function(self, key, value)
@@ -3317,6 +3789,19 @@ make_env = function(identifier)
 		end
 	})
 	r['enum'] = enum
+
+	decorator_meta = {__concat =
+		function(a, f)
+			return function(...)
+				return a[1](f, ...)(...)
+			end
+		end,
+		__type = 'decorator',
+	}
+
+	r['decorator'] = function(...)
+		return setmetatable({...}, decorator_meta)
+	end
 
 	-- Copy to builtins
 	r['builtins'] = {}
@@ -3357,6 +3842,9 @@ make_env = function(identifier)
 			uuid = open_uuid,
 			json = open_json,
 			luaj = open_luaj,
+			help = open_help,
+			parser = open_parser,
+			hash = open_hash,
 		}
 
 		local stdlib = function(root)
@@ -3378,6 +3866,10 @@ make_env = function(identifier)
 
 		if library_openers[key] ~= nil then
 			if rawget(self, key) == nil then
+				if key == 'help' then
+					-- Expose help information...
+					open_std_util_help()
+				end
 				return library_openers[key](self)[key]
 			end
 			return rawget(self, key)
@@ -3395,6 +3887,7 @@ make_env = function(identifier)
 	-- Expected self reference.
 	r._G = r
 	r._G.__index = r._G
+	setmetatable(r._G, meta)
 
 	return r
 end
@@ -3435,8 +3928,8 @@ load_source = function(source, identifier, lib, env)
 	end
 
 	-- If has a hashbang line, clear that line.
-	if source:sub(1, 2) == '#!' then
-		source = source:sub(source:find("\n") + 1)
+	if string.sub(source, 1, 2) == '#!' then
+		source = string.sub(source, string.find(source, "\n") + 1)
 	end
 
 	-- Replace default metatables...
@@ -3502,6 +3995,7 @@ local repl = function()
 	print(string.format("Luaj v%s", env._VERSION))
 	print("Preface statements with = or return to get their value.")
 	print("Place 'q' alone on its own line to exit.")
+	print("Try `=help(print)`")
 
 	-- If Lua can find linenoise, we should use it. Otherwise, fall back to this behaviour.
 	local L = require 'linenoise'
