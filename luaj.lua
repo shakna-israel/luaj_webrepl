@@ -7,7 +7,72 @@ local load_source = nil
 local make_env = nil
 local docstrings = {}
 
-local luaj_version = {0,9,0}
+local luaj_version = {0,11,0}
+
+local better_random = function(x, y)
+	if x == nil and y == nil then
+		x = 0
+		y = 1
+	end
+	if x ~= nil and y == nil then
+		y = x
+		x = 1
+	end
+
+	-- Try and open urandom
+	local fr = io.open("/dev/urandom", 'rb')
+
+	-- Failed, maybe we're on BSD?
+	if fr == nil then
+		fr = io.open("/dev/random", 'rb')
+	end
+
+	-- Fallback to Lua behaviour
+	if fr == nil then
+		return math.random(x, y)
+	end
+
+	-- Read 0-9 from a random source
+    local get_num = function()
+    	while true do
+	    	local c = fr:read(1)
+	    	c = tostring(string.byte(c))
+	    	return tonumber(string.sub(c, #c, #c))
+    	end
+    end
+
+    -- Get our digit range
+    local max_digits = #tostring(y)
+
+    -- Reduce the problem set as much as we can
+    local diff = y - x
+    y = diff
+    min_add = x
+    x = 0
+
+    -- Search for a value within range
+    local final = x - 1
+    while final > y or final < x do
+    	local digits = {}
+	    while #digits < max_digits do
+	    	local r = get_num()
+	    	digits[#digits + 1] = tostring(r)
+	    	if #digits > 0 then
+	    		if get_num() % 4 == 0 then
+	    			break
+	    		end
+	    	end
+
+	    	if tonumber(table.concat(digits)) > y then
+	    		digits = {}
+	    	end
+	    end
+	    final = tonumber(table.concat(digits))
+    end
+
+    fr:close()
+    return final + min_add
+end
 
 local gen_operator = function(f)
 	local mt = { __sub = function(self, b)
@@ -183,7 +248,12 @@ local iter = function(tbl, options)
 
 	local sorter
 	if not options.sorter then
-		sorter = function(a, b) return a < b end
+		sorter = function(a, b)
+			if type(a) ~= type(b) then
+				return type_comparison(a, b)
+			end
+			return a < b
+		end
 	else
 		sorter = options.sorter
 	end
@@ -194,25 +264,34 @@ local iter = function(tbl, options)
 	end
 	table.sort(keys, sorter)
 
+	local index
+	local count
+	local get_next
+	local check
+
 	if options.reverse then
-
-		local index = #keys + 1
-		local count = 0
-
-		return function()
-			index = index - 1
-			if index >= count then
-				return keys[index], tbl[keys[index]]
-			end
+		index = #keys + 1
+		count = 0
+		get_next = function(i)
+			return i - 1
+		end
+		check = function(i, c)
+			return i >= c
+		end
+	else
+		index = 0
+		count = #keys
+		get_next = function(i)
+			return i + 1
+		end
+		check = function(i, c)
+			return i <= c
 		end
 	end
 
-	local index = 0
-	local count = #keys
-
 	return function()
-		index = index + 1
-		if index <= count then
+		index = get_next(index)
+		if check(index, count) then
 			return keys[index], tbl[keys[index]]
 		end
 	end
@@ -357,7 +436,12 @@ do
   end
 end
 
+local type_comparison = function(a, b)
+	local a = tostring(luaj_type(a))
+	local b = tostring(luaj_type(b))
 
+	return a < b
+end
 
 local try = function(functor, arguments, except)
 	if arguments == nil then
@@ -466,7 +550,10 @@ local iformat = function(source, data)
 	  	local x = tab[w:sub(3, -2)] or w
 
 	  	-- TODO: handle objects with "no literal form"
-	  	if type(x) == 'table' or type(x) == 'userdata' then
+	  	if type(x) == 'table' or
+	  	   type(x) == 'userdata' or
+	  	   type(x) == 'function'
+	  	then
 	  		return tostring(x)
 	  	end
 
@@ -1310,12 +1397,15 @@ local open_contract = function(root)
 
 	-- Our type matcher...
 	contract.match_type = function(a, b)
-		-- Match a standard type...
 		if luaj_type(b) == "string" then
+			-- Match a primitive
 			return luaj_type(a) == b
-		else
-			-- Match one of our, or the user's, type definitions.
+		elseif callable(b) then
+			-- Match an algebraic type			
 			return b(a)
+		else
+			-- Fallback for non-string type returns.
+			return luaj_type(a) == b
 		end
 	end
 
@@ -1376,6 +1466,9 @@ local open_contract = function(root)
 
 	local meta = getmetatable(contract) or {}
 	meta.__type = "library"
+	meta.__call = function(self, ...)
+		return contract.contract(...)
+	end
 	setmetatable(contract, meta)
 
 	return root
@@ -1491,6 +1584,11 @@ local open_csv = function(root)
 		for i=1, #source do
 			local c = string.sub(source, i, i)
 			if c == '\n' then
+
+				if line[#line] == '\r' then
+					table.remove(line, #line)
+				end
+
 				lines[#lines + 1] = table.concat(line)
 				line = {}
 			else
@@ -1595,7 +1693,7 @@ local open_csv = function(root)
 			r[#r+1] = table.concat(x, options.seperator)
 		end
 
-		return table.concat(r, '\n')
+		return table.concat(r, '\r\n')
 	end
 
 	local meta = getmetatable(r) or {}
@@ -2067,27 +2165,16 @@ local open_uuid = function(root)
 
 	-- UUID v4, random
 	do
-		local seeded = false
 		uuid.uuid4 = function()
-			if seeded == false then
-				math.randomseed(os.time())
-				seeded = true
-			end
-
 			local template ='xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'
 		    local x = string.gsub(template, '[xy]', function (c)
-		        local v = (c == 'x') and math.random(0, 0xf) or math.random(8, 0xb)
+		        local v = (c == 'x') and better_random(0, 0xf) or better_random(8, 0xb)
 		        return string.format('%x', v)
 		    end)
 		    return x
 		end
 
 		uuid.uuida = function()
-			if seeded == false then
-				math.randomseed(os.time())
-				seeded = true
-			end
-
 			local t = os.date("*t")
 
 			local year = string.format("%04d", t.year)
@@ -2101,7 +2188,7 @@ local open_uuid = function(root)
 
 			local template = node .. '-' .. secondary_node .. '-axxx-yxxx-xxxxxxxxxxxx'
 			local x = string.gsub(template, '[xy]', function (c)
-		        local v = (c == 'x') and math.random(0, 0xf) or math.random(8, 0xb)
+		        local v = (c == 'x') and better_random(0, 0xf) or better_random(8, 0xb)
 		        return string.format('%x', v)
 		    end)
 		    return x
@@ -2129,8 +2216,13 @@ local open_ini = function(root)
 		for i=1, #s do
 			local c = s:sub(i, i)
 			if c == '\n' then
-				r[#r+1] = table.concat(token)
-				token = {}
+				-- Allow line continuations
+				if token[#token] == '\\' then
+					table.remove(token, #token)
+				else
+					r[#r+1] = table.concat(token)
+					token = {}
+				end
 			else
 				token[#token + 1] = c
 			end
@@ -2159,29 +2251,93 @@ local open_ini = function(root)
 		return s
 	end
 
-	local ini_parse = function(source)
+	local escape_string = function(s)
+		s = string.gsub(s, '".-"', function(inside_string)
+			return string.gsub(inside_string, "\\(.)", function(x)
+				if x == 'x' then
+					-- Ignore. This is a long-style escape.
+					return x
+				elseif x == 'a' then
+					return string.format("\\x%03d", string.byte('\a'))
+				elseif x == 'b' then
+					return string.format("\\x%03d", string.byte('\b'))
+				elseif x == 'f' then
+					return string.format("\\x%03d", string.byte('\f'))
+				elseif x == 'n' then
+					return string.format("\\x%03d", string.byte('\n'))
+				elseif x == 'r' then
+					return string.format("\\x%03d", string.byte('\r'))
+				elseif x == 't' then
+					return string.format("\\x%03d", string.byte('\t'))
+				elseif x == 'v' then
+					return string.format("\\x%03d", string.byte('\v'))
+				else
+					return string.format("\\x%03d", string.byte(x))
+				end
+			end)
+		end)
+
+		return s
+	end
+
+	local decode_string = function(s)
+		return (string.gsub(s, "\\x(%d%d%d)", function(d)
+			return string.char(tonumber(d))
+		end))
+	end
+
+	local ini_parse = function(source, options)
 		local current_heading = nil
 		local r = {}
+
+		-- Defaults
+		if not options then
+			options = {}
+		end
+		if not options.seperator then
+			options.seperator = '='
+		end
+		if not options.comments then
+			options.comments = {[';'] = true, ['#'] = true}
+		end
+		if not options.undefined_section then
+			options.undefined_section = 'undefined section'
+		end
+		if options.case_sensitive == nil then
+			options.case_sensitive = true
+		end
 
 		local lines = ini_lines(source)
 
 		for idx, item in ipairs(lines) do
 			line = ini_strip(item)
 			if #line > 0 then
-				if line:sub(1, 1) == ';' then
+				if options.comments[line:sub(1, 1)] then
 					-- A comment. Do nothing.
 				elseif line:sub(1,1) == '[' and line:sub(#line, #line) == ']' then
 					current_heading = ini_strip(line:sub(2, #line - 1))
+
+					-- Windows-style behaviour
+					if not options.case_sensitive then
+						current_heading = string.lower(current_heading)
+					end
+
 					r[current_heading] = {}
-				elseif line:find('=') ~= nil then
+				elseif line:find(options.seperator) ~= nil then
 					-- Seperate varname and value
-					idx = line:find('=')
+					idx = line:find(options.seperator)
 					var = ini_strip(line:sub(1, idx - 1))
+
+					-- Windows-style behaviour
+					if not options.case_sensitive then
+						var = string.lower(var)
+					end
+
 					val_raw = line:sub(idx + 1)
 
 					-- Ensure we have a valid section
 					if current_heading == nil then
-						current_heading = 'undefined section'
+						current_heading = options.undefined_section
 						if r[current_heading] == nil then
 							r[current_heading] = {}
 						end
@@ -2189,27 +2345,73 @@ local open_ini = function(root)
 
 					-- Guess the type of the value
 					if tonumber(val_raw) ~= nil then
-						r[current_heading][var] = tonumber(val_raw)
+						if options.duplicate ~= nil then
+							if r[current_heading][var] ~= nil then
+								options.duplicate(current_heading, var, tonumber(val_raw), r)
+							else
+								r[current_heading][var] = tonumber(val_raw)
+							end
+						else
+							r[current_heading][var] = tonumber(val_raw)
+						end
 					else
-						r[current_heading][var] = val_raw
+						-- If double or single-quoted, remove quotes.
+						-- This is a Windows behaviour.
+						if val_raw:sub(1, 1) == '"' and val_raw:sub(#val_raw, #val_raw) == '"' then
+							val_raw = val_raw:sub(2, #val_raw - 1)
+						elseif val_raw:sub(1, 1) == "'" and val_raw:sub(#val_raw, #val_raw) == "'" then
+							val_raw = val_raw:sub(2, #val_raw - 1)
+						end
+
+						-- Convert to hex only escapes...
+						val_raw = escape_string('"' .. val_raw .. '"')
+						-- Expand escapes
+						val_raw = decode_string(val_raw)
+						-- Strip our injected quotes
+						val_raw = val_raw:sub(2, #val_raw - 1)
+
+						if options.duplicate ~= nil then
+							if r[current_heading][var] ~= nil then
+								options.duplicate(current_heading, var, val_raw, r)
+							else
+								r[current_heading][var] = val_raw
+							end
+						else
+							-- Install the value
+							r[current_heading][var] = val_raw
+						end
+						
 					end
 				end
 			end
 		end
 
+		-- Case insensitive indexing
+		if not options.case_sensitive then
+			local meta = {__index = function(self, key)
+				key = string.lower(key)
+				return rawget(self, key)
+			end}
+			setmetatable(r, meta)
+		end
+
 		return r
 	end
 
-	r.read_file = function(filename)
+	r.read_file = function(filename, options)
 		local f = io.open(filename, "r")
 		if f == nil then
 			return nil
 		end
 
-		local d = ini_parse(f:read("*all"))
+		local d = ini_parse(f:read("*all"), options)
 		f:close()
 
 		return d
+	end
+
+	r.read_string = function(source, options)
+		return ini_parse(source, options)
 	end
 
 	local meta = getmetatable(root['ini']) or {}
@@ -2563,11 +2765,38 @@ local open_os = function(root)
 	-- OS Specific Library
 	-- Most things have been moved out.
 	r['os'] = {}
-	r['os']['setlocale'] = os.setlocale
-	r['os']['env'] = os.getenv
 
-	-- TODO: whoami
-	-- TODO: hostname
+	r['os']['locale'] = {}
+	r['os']['locale']['set'] = os.setlocale
+
+	r['os']['locale']['get'] = function(category)
+		return os.setlocale(nil, category)
+	end
+
+	r['os']['env'] = function(key, value)
+		if value == nil then
+			return os.getenv(key)
+		else
+			return os.setenv(key, value)
+		end
+	end
+
+	r['os']['whoami'] = function()
+		return os.getenv("USER") or os.getenv("username")
+	end
+
+	r['os']['hostname'] = function()
+		local f = io.popen('hostname', 'r')
+		if not f then
+			return nil
+		end
+
+		local s = f:read("*all")
+		f:close()
+
+		return string.sub(s, 1, #s - 1)
+	end
+
 	-- TODO: os name
 
 	local meta = getmetatable(r['os']) or {}
@@ -2708,8 +2937,42 @@ local open_io = function(root)
 	-- I/O Library.
 	-- open/close are moved to base available.
 	r['io'] = {}
-	
+
 	r['io']['popen'] = io.popen
+	
+	r['io']['run'] = function(statement, ...)
+		local sep = package.config:sub(1,1)
+
+		local args = {...}
+		for idx, arg in ipairs(args) do
+			local x = string.format("%q", tostring(arg))
+			x = "'" .. x:sub(2, #x - 1):gsub("'", "\\'") .. "'"
+			statement = statement .. ' ' .. x
+		end
+
+		-- Windows implementation
+		if sep == '\\' then
+			local f = io.open(statement, 'r')
+			local s = f:read("*all")
+			local rc = {f:close()}
+
+			return rc[3] or rc[1], s
+		end
+
+		-- Hack to get the status code...
+		local f = io.popen(statement .. '; echo "-retcode:$?"', 'r')
+
+		local s = f:read("*all")
+		f:close()
+
+		local i1, i2, ret = s:find('%-retcode:(%d+)\n$')
+		s = s:sub(1, i1-1)
+
+		ret = tonumber(ret) or ret
+
+		return ret, s
+	end
+
 	r['io']['lines'] = io.lines
 
 	r['io']['tmpfile'] = io.tmpfile
@@ -2745,6 +3008,10 @@ local open_io = function(root)
 
 	r['io']['datapath'] = datapath
 
+	r['io']['constant'] = {}
+
+	r['io']['constant']['seperator'] = package.config:sub(1,1)
+
 	local meta = getmetatable(r['io']) or {}
 	meta.__type = "library"
 	setmetatable(r['io'], meta)
@@ -2769,7 +3036,10 @@ local open_random = function(root)
 			math.randomseed(os.time())
 		end
 	end
+
 	r['random']['random'] = math.random
+	r['random']['urandom'] = better_random
+
 	r['random']['choice'] = function(tbl)
 		local min = 1
 		local max = #tbl
@@ -2786,6 +3056,7 @@ local open_random = function(root)
 	end
 
 	-- TODO: r['random']['weighted'] = lib.random_weighted
+	-- TODO: r['random']['string'](pattern, length)
 
 	local meta = getmetatable(r['random']) or {}
 	meta.__type = "library"
@@ -3422,7 +3693,7 @@ local open_math = function(root)
 	r['math']['constant'] = {}
 	r['math']['constant']['maxinteger'] = math.maxinteger
 	r['math']['constant']['mininteger'] = math.mininteger
-	r['math']['constant']['huge'] = math.huge
+	r['math']['constant']['infinite'] = math.huge
 	r['math']['constant']['pi'] = math.pi
 	r['math']['constant']['nan'] = 0/0
 
@@ -3457,6 +3728,19 @@ local open_math = function(root)
 	r['math']['sine'] = math.sin
 	r['math']['modf'] = math.modf
 	r['math']['type'] = math.type
+
+	r['math']['greatest_common_divisor'] = function(a, b)
+		while b ~= 0 do
+			local c = a % b
+			a = b
+			b = c
+		end
+		return a
+	end
+
+	r['math']['least_common_multiple'] = function(a, b)
+		return a * b // r['math']['greatest_common_divisor'](a, b)
+	end
 
 	r['math']['round'] = {}
 	r['math']['round']['up'] = gen_operator(function(x, n)
@@ -3501,6 +3785,14 @@ local open_math = function(root)
 
 	r['math']['clamp'] = function(x, n, y)
 		local t = {x, n, y}
+
+		-- Return NaN if one is included.
+		for _, k in pairs(t) do
+			if k ~= k then
+				return k
+			end
+		end
+
 		table.sort(t)
 		return t[2]
 	end
@@ -3534,6 +3826,35 @@ end
 
 make_env = function(identifier)
 	local r = {}
+
+	local library_openers = {
+		math = open_math,
+		table = open_table,
+		functional = open_functional,
+		random = open_random,
+		io = open_io,
+		string = open_string,
+		struct = open_struct,
+		os = open_os,
+		time = open_time,
+		coroutine = open_coroutine,
+		bitop = open_bitop,
+		utf8 = open_utf8,
+		lua = open_lua,
+		class = open_class,
+		unittest = open_test,
+		csv = open_csv,
+		ini = open_ini,
+		contract = open_contract,
+		base64 = open_base64,
+		cli = open_cli,
+		uuid = open_uuid,
+		json = open_json,
+		luaj = open_luaj,
+		help = open_help,
+		parser = open_parser,
+		hash = open_hash,
+	}
 
 	local open_std_util_help = function()
 		docstrings[r['_VERSION']] = "The current Luaj version"
@@ -3607,10 +3928,35 @@ make_env = function(identifier)
 	r['tostring'] = tostring
 
 	r['unpack'] = unpack
-	r['pack'] = table.pack
+
+	r['pack'] = function(...)
+		return {...}
+	end
+
+	r['packn'] = function(n, ...)
+		if n == '#' then
+			return select(n, ...)
+		else
+			return {select(n, ...)}
+		end
+	end
+
 	r['join'] = table.concat
 	r['split'] = split
-	r['sort'] = table.sort
+
+	r['sort'] = function(tbl, sorter)
+
+		if sorter == nil then
+			sorter = function(a, b)
+				if type(a) ~= type(b) then
+					return type_comparison(a, b)
+				end
+				return a < b
+			end
+		end
+
+		table.sort(tbl, sorter)
+	end
 
 	r['max'] = math.max
 	r['min'] = math.min
@@ -3663,6 +4009,12 @@ make_env = function(identifier)
 			ref_dir = ref_dir:sub(1, #ref_dir - 1)
 		end
 
+		-- TODO: Allow overriding these somehow...
+
+		-- Absolute path
+		paths[#paths + 1] = "?.lua"
+
+		-- Local paths
 		paths[#paths + 1] = string.format("%s%s?.lua", ref_dir, path_sep)
 		paths[#paths + 1] = string.format("%s%s?%sinit.lua",
 			ref_dir, path_sep, path_sep)
@@ -3717,14 +4069,29 @@ make_env = function(identifier)
 			if f ~= nil then
 				local source = f:read("*all")
 				f:close()
-				local data = load_source(source, v, true)
-				return data()
+				local data, err = load_source(source, v, true)
+				if err then
+					return nil
+				else
+					return data()
+				end
 			end
 		end
+
+		-- Try stdlibs as fallback
+		if library_openers[name] then
+			return library_openers[name]({})[name]
+		end
+
+		return nil
 	end
 
 	r['switch'] = function(case)
 		return function(codetable)
+
+			-- TODO: Expand to support functions as keys,
+			-- where the function returns a boolean, like cond
+
 			local f
 			f = codetable[case] or codetable.default
 
@@ -3817,35 +4184,6 @@ make_env = function(identifier)
 	local meta = getmetatable(r) or {}
 	meta.__type = "environment"
 	meta.__index = function(self, key)
-
-		local library_openers = {
-			math = open_math,
-			table = open_table,
-			functional = open_functional,
-			random = open_random,
-			io = open_io,
-			string = open_string,
-			struct = open_struct,
-			os = open_os,
-			time = open_time,
-			coroutine = open_coroutine,
-			bitop = open_bitop,
-			utf8 = open_utf8,
-			lua = open_lua,
-			class = open_class,
-			unittest = open_test,
-			csv = open_csv,
-			ini = open_ini,
-			contract = open_contract,
-			base64 = open_base64,
-			cli = open_cli,
-			uuid = open_uuid,
-			json = open_json,
-			luaj = open_luaj,
-			help = open_help,
-			parser = open_parser,
-			hash = open_hash,
-		}
 
 		local stdlib = function(root)
 			root['stdlib'] = {}
@@ -3999,10 +4337,14 @@ local repl = function()
 
 	-- If Lua can find linenoise, we should use it. Otherwise, fall back to this behaviour.
 	local L = require 'linenoise'
+	local history_filename
 	if L ~= nil then
 		-- TODO: Add completion & hints based on keywords + locals
-		-- TODO: Support history file?
+
 		L.enableutf8()
+
+		history_filename = datapath() .. 'luaj' .. package.config:sub(1,1) .. '.history'
+		L.historyload(history_filename)
 	end
 
 	while true do
@@ -4020,6 +4362,11 @@ local repl = function()
 		end
 		statement_count = statement_count + 1
 
+		-- Nothing read. Probably CTRL+D or other EOF.
+		if source == nil then
+			os.exit(0)
+		end
+
 		-- Support the Lua REPL shorthand for return
 		if source:sub(1, 1) == '=' then
 			source = 'return ' .. source:sub(2)
@@ -4036,6 +4383,7 @@ local repl = function()
 		else
 			if L ~= nil then
 				L.historyadd(source)
+				L.historysave(history_filename)
 			end
 
 			local d = {pcall(func)}
