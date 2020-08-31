@@ -7,7 +7,7 @@ local load_source = nil
 local make_env = nil
 local docstrings = {}
 
-local luaj_version = {0,11,0}
+local luaj_version = {0,12,0}
 
 local better_random = function(x, y)
 	if x == nil and y == nil then
@@ -479,6 +479,11 @@ local try = function(functor, arguments, except)
 				error_code = data[2]
 			end
 
+			-- Account for Luaj error message construction
+			error_code = string.sub(error_code, 8)
+			local idx, _ = string.find(error_code, '\n')
+			error_code = string.sub(error_code, 1, idx - 1)
+
 			-- Unaccounted for error, re-raise at the try-caller level.
 			if except[error_code] == nil then
 				error(data[2], 2)
@@ -549,15 +554,16 @@ local iformat = function(source, data)
 	  return (s:gsub('($%b{})', function(w)
 	  	local x = tab[w:sub(3, -2)] or w
 
-	  	-- TODO: handle objects with "no literal form"
-	  	if type(x) == 'table' or
-	  	   type(x) == 'userdata' or
-	  	   type(x) == 'function'
-	  	then
-	  		return tostring(x)
+	  	-- Special handling if we can get the function name...
+	  	if type(x) == 'function' then
+
+	  		local name = debug.getinfo(x).name
+	  		if name ~= nil then
+	  			return string.format("function: %s", name)
+	  		end
 	  	end
 
-	  	return x
+	  	return string.format("%s", x)
 	  end))
 	end
 
@@ -884,6 +890,90 @@ local open_parser = function(root)
 		end
 
 		return iterator, ast, 0
+	end
+
+	lib.template = function(source, model)
+		local lex = function(str)
+			-- Converts the given string to equivalent
+			-- Lua code but turning things "inside out".
+			-- Most things get converted to a string.
+			--    Strings are using [===[ and ]===] as the outer symbols.
+			--    So avoid those.
+			-- Things inside {% and %} get treated as a Lua statement.
+			-- Things inside {{ and }} get placed inside tostring. (Called 'value')
+
+			local inside = 'string'
+			local r = {}
+			for i = 1, # str do
+				local c = str:sub(i, i)
+				if #r == 0 then
+					r[1] = 's = {}; s[#s + 1] = [===['
+					r[#r + 1] = c
+				elseif inside == 'string' then
+					if c == '%' and r[#r] == '{' then
+						r[#r] = ']===]\n'
+						inside = 'statement'
+					elseif c == '{' and r[#r] == '{' then
+						r[#r] = ']===] .. _tostring('
+						inside = 'value'
+					else
+						r[#r + 1] = c
+					end
+				elseif inside == 'statement' then
+					if c == '}' and r[#r] == '%' then
+						r[#r] = '\n'
+						inside = 'string'
+						r[#r + 1] = 's[#s + 1] = [===['
+					else
+						r[#r + 1] = c
+					end
+				elseif inside == 'value' then
+					if c == '}' and r[#r] == '}' then
+						r[#r] = ')\n'
+						inside = 'string'
+						r[#r + 1] = 's[#s + 1] = [===['
+					else
+						r[#r + 1] = c
+					end
+				end
+			end
+
+			if inside == 'string' then
+				r[#r + 1] = ']===]\n'
+			end
+			r[#r + 1] = 'return _concat(s, "")'
+
+			return table.concat(r, '')
+		end
+
+		local inner_render = function(rawdata, model)
+			-- Set up model minimal requirements.
+			if not model then model = {} end
+			model['_tostring'] = tostring
+			model['_concat'] = table.concat
+			model['values'] = value_iterator
+			model['iter'] = iter
+			model['next'] = next
+			model['type'] = luaj_type
+
+			local tmp = 'return function()' .. lex(rawdata) .. 'end'
+			-- TODO: Propogate error messages from this level...
+			return load(tmp, nil, nil, model)()()
+		end
+
+		local render = function(rawdata, model)
+			local status, ret = pcall(inner_render, rawdata, model)
+			return status, ret
+		end
+
+		local f = io.open(source, "r")
+  		if f == nil then
+  			return render(source, model)
+  		else
+  			local datastring = f:read("*all")
+  			f:close()
+  			return render(source, model)
+  		end
 	end
 
 	local meta = getmetatable(lib) or {}
@@ -2133,12 +2223,9 @@ local open_json = function(root)
 	return root
 end
 
--- TODO: Help library
 -- TODO: BigNum library
 
 -- TODO: Hash library
--- jenkins/adler/fletcher implemented in https://git.sr.ht/~shakna/cnoevil3/tree/master/include/evil_hash.h
--- Luhn hash: https://github.com/aiq/luazdf/blob/master/algo/luhn/luhn.lua
 
 -- TODO: TOML library
 
@@ -2530,6 +2617,12 @@ end
 local open_utf8 = function(root)
 	local r = root
 
+	-- TODO: Shim for if UTF8 is unavailable
+	if utf8 == nil then
+		utf8 = {}
+		utf8.charpattern = "[%z\1-\127\194-\244][\128-\191]*"
+	end
+
 	-- UTF8 Library
 	r['utf8'] = {}
 
@@ -2678,12 +2771,111 @@ end
 local open_bitop = function(root)
 	local r = root
 
-	-- TODO: Luajit's "bit" library compatibility shim.
-
-	-- TODO: We should have a plain-Lua fallback too.
-
+	-- Compatibility shim...
 	if bit32 == nil then
 		r['bitop'] = {}
+
+		local bxor = function(a, b)
+			local p,c=1,0
+			while a>0 and b>0 do
+				local ra,rb=a%2,b%2
+				if ra~=rb then
+					c=c+p
+				end
+			
+				a,b,p=(a-ra)/2,(b-rb)/2,p*2
+			end
+			
+			if a<b then
+				a=b
+			end
+			
+			while a>0 do
+				local ra=a%2
+				if ra>0 then
+					c=c+p
+				end
+				a,p=(a-ra)/2,p*2
+			end
+			return c
+		end
+
+		local band = function(a, b)
+			return ((a+b) - bxor(a,b)) / 2
+		end
+
+		local rshift, lshift
+
+		rshift = function(a,disp)
+			if disp < 0 then
+				return lshift(a,-disp)
+			end
+			return math.floor(a % 2^32 / 2^disp)
+		end
+
+		lshift = function(a,disp) -- Lua5.2 inspired
+				if disp < 0 then
+					return rshift(a,-disp)
+				end
+			return (a * 2^disp) % 2^32
+		end
+
+		r['bitop']['extract'] = function(n, field, width)
+			width = width or 1
+				return band(rshift(n, field), 2^width-1)
+		end
+
+		r['bitop']['and0'] = function(x, y)
+			return band(x, y) ~= 0
+		end
+
+		r['bitop']['arshift'] = function(x, disp)
+		local z = rshift(x, disp)
+		if x >= 0x80000000 then
+			z = z + lshift(2^disp-1, 32-disp)
+		end
+			return z
+		end
+
+		r['bitop']['rshift'] = rshift
+
+		local rrotate = function(x, disp)
+			disp = disp % 32
+			local low = band(x, 2^disp-1)
+			return rshift(x, disp) + lshift(low, 32-disp)
+		end
+
+		r['bitop']['lrotate'] = function(x, disp)
+			return rrotate(x, -disp)
+		end
+
+		r['bitop']['rrotate'] = rrotate
+
+		local bnot = function(x)
+			return (-1 - x) % 2^32
+		end
+
+		r['bitop']['replace'] = function(n, v, field, width)
+			width = width or 1
+			local mask1 = 2^width-1
+			v = band(v, mask1)
+			local mask = bnot(lshift(mask1, field))
+			return band(n, mask) + lshift(v, field)
+		end
+
+		r['bitop']['lshift'] = lshift
+		r['bitop']['band'] = band
+		r['bitop']['bxor'] = bxor
+		r['bitop']['bor'] = function(a,b)
+			return (2^32 - 1) - band((2^32 - 1) - a, (2^32 - 1) - b)
+		end
+
+		r['bitop']['bnot'] = bnot
+
+		local meta = getmetatable(r['bitop']) or {}
+		meta.__type = "library"
+		setmetatable(r['bitop'], meta)
+
 		return r
 	end
 
@@ -2748,9 +2940,199 @@ local open_time = function(root)
 	r['time']['clock'] = os.clock
 	r['time']['diff'] = os.difftime
 
-	-- TODO: There's some useful calendar functions
-	-- @ https://github.com/aiq/luazdf/tree/master/cal
-	-- that we could reimplement.
+	r['time']['day'] = function(i)
+		if i == 1 then
+			return 'Sunday'
+		elseif i == 2 then
+			return 'Monday'
+		elseif i == 3 then
+			return 'Tuesday'
+		elseif i == 4 then
+			return 'Wednesday'
+		elseif i == 5 then
+			return 'Thursday'
+		elseif i == 6 then
+			return 'Friday'
+		elseif i == 7 then
+			return 'Saturday'
+		else
+			return 'Unknown'
+		end
+	end
+
+	r['time']['month'] = function(i)
+		if i == 1 then
+			return 'January'
+		elseif i == 2 then
+			return 'February'
+		elseif i == 3 then
+			return 'March'
+		elseif i == 4 then
+			return 'April'
+		elseif i == 5 then
+			return 'May'
+		elseif i == 6 then
+			return 'June'
+		elseif i == 7 then
+			return 'July'
+		elseif i == 8 then
+			return 'August'
+		elseif i == 9 then
+			return 'September'
+		elseif i == 10 then
+			return 'October'
+		elseif i == 11 then
+			return 'November'
+		elseif i == 12 then
+			return 'December'
+		else
+			return 'Unknown'
+		end
+
+	end
+
+	r['time']['isleapyear'] = function(year)
+		return (year % 4 == 0 and year % 100 ~= 0) or (year % 400 == 0)
+	end
+
+	-- tojulian
+	r['time']['tojulian'] = function(epoch)
+		local dt = os.date("!*t", epoch) -- UTC
+
+		-- Base year
+		if dt.year < 0 then
+			dt.year = dt.year + 1
+		end
+
+		if (dt.year > 1582) or
+			(dt.year == 1582 and
+				(dt.month > 10 or
+					(dt.month == 10 and dt.day >= 15)))
+		then
+			local k = math.ceil((dt.month - 14 ) / 12)
+			local a = math.floor((dt.year + 4800 + k ) * 365.25)
+			local b = math.floor((367 * (dt.month - 2 - 12 * k)) / 12)
+			local c = math.floor(((dt.year + 4900 + k) / 100 ) * 0.75)
+
+			return a + b - c + dt.day - 32075
+		elseif (dt.year < 1582) or
+			(dt.year == 1582 and
+				(dt.month < 10 or
+					((dt.month == 10 and dt.day <= 4))))
+		then
+			local k = math.floor((14 - dt.month ) / 12)
+			local a = math.floor((153 * ( dt.month + (12 * k) - 3) + 2) / 5)
+			local b = math.floor((dt.year + 4800 - k) * 365.25)
+
+			return a + b + dt.day - 32083;
+		else
+			return 0
+		end
+	end
+
+	-- togregorian (from julian days)
+	r['time']['togregorian'] = function(JDN)
+		local tmp = {}
+
+		local a = 0
+		if JDN >= 2299161 then
+			local g = math.floor((JDN - 1867216.25 ) / 36524.25)
+      		a = JDN + 1 + g - math.floor(g / 4)
+		else
+			a = JDN
+		end
+
+		local b = a + 1524
+		local c = math.floor((b - 122.1) / 365.25)
+		local d = math.floor(365.25 * c)
+		local e = math.floor((b - d) / 30.6001)
+
+		-- Get the day
+		local day = b - d - math.floor(30.6001 * e)
+
+		local month
+		if e < 14 then
+			month = e - 1
+		else
+			month = e - 13
+		end
+
+		local year
+		if month > 2 then
+			year = c - 4716
+		else
+			year = c - 4715
+		end
+
+		return {year = year, month = month, day = day}
+	end
+
+	r['time']['tostardate'] = function(epoch)
+		-- Uses the STO way of converting the epoch.
+		local reference = {earthdate = 2019, stardate = 96601.20}
+
+		local dt = os.date("!*t", epoch or os.time()) -- Convert to UTC.
+
+		local year_days
+		if r['time']['isleapyear'](dt.year) then
+			year_days = 366
+		else
+			year_days = 365
+		end
+
+		local stardate = ((reference["stardate"] +
+                        (1000*(dt.year - reference["earthdate"]))) +
+                      ((1000/((year_days)*1440.0))*(((
+                            dt.yday - 1.0)*1440.0) +
+                        (dt.hour*60.0) + dt.min)))
+
+		return tonumber(string.format("%.2f", stardate))
+	end
+
+	-- RFC conversion functions
+	r['time']['rfc'] = {}
+
+	r['time']['rfc']['2822'] = function(epoch)
+		-- e.g. Mon, 31 Aug 2020 12:38:09 +1000
+
+		if epoch == nil then
+			epoch = os.time()
+		end
+
+		local utc = os.date("!*t", epoch)
+		local localtime = os.date("*t", epoch)
+
+		-- Get the offset
+		local shift_h  = localtime.hour - utc.hour +  (utc.isdst and 1 or 0)    -- +1 hour if daylight saving
+		local shift_m = 100 * (localtime.min  - utc.min) / 60
+
+		local offset = string.format('%+05d' , shift_h*100 + shift_m)
+
+		local dt1 = localtime
+
+		-- Get the 3-letter day
+		local day_str = string.sub(r['time']['day'](dt1.wday), 1, 3)
+
+		-- Get the day number
+		local day = dt1.day
+
+		-- Get the 3-letter month
+		local month_str = string.sub(r['time']['month'](dt1.month), 1, 3)
+
+		-- Get the year
+		local year = dt1.year
+
+		-- Get the hour
+		local hour = string.format("%02d", dt1.hour)
+
+		-- Get the minute
+		local min = string.format("%02d", dt1.min)
+
+		-- Get the second
+		local second = string.format("%02d", dt1.sec)
+
+		return string.format("%s, %s %s %s %s:%s:%s %s", day_str, day, month_str, year, hour, min, second, offset)
+	end
 
 	local meta = getmetatable(r['time']) or {}
 	meta.__type = "library"
@@ -3093,13 +3475,26 @@ local open_functional = function(root)
 	end
 
 	r['functional']['apply'] = function(functor, ...)
-	  -- TODO: This is an overly naive way of doing it...
-	  local args = {...}
-	  local meta = getmetatable(functor) or {}
-	  assert(type(functor) == "function" or
-	  	type(meta.__call) == "function",
-	  	"apply expects functor to be a function")
-	  return functor(unpack(args))
+	  local debug_info = debug.getinfo(functor)
+
+	  assert(callable(functor), "apply functor must be a callable.")
+
+	  if debug_info.isvararg then
+		  return functor(...)
+	  else
+	  	-- Divide up based on debug_info.nparams
+	  	local args = {...}
+	  	local val = nil -- First call passes nil on the right-hand side.
+	  	for i=1, #args, debug_info.nparams - 1 do
+	  		local arg_pack = {}
+	  		for i=i, i + (debug_info.nparams - 1) do
+	  			arg_pack[#arg_pack+1] = args[i]
+	  		end
+	  		val = functor(unpack(arg_pack), val)
+	  	end
+
+	  	return val
+	  end
 	end
 
 	r['functional']['map'] = function(functor, ...)
@@ -3620,6 +4015,8 @@ local open_hash = function(root)
 	root['hash'] = {}
 	local r = root['hash']
 
+	local bit32 = open_bitop({})['bitop']
+
 	-- jenkins
 	r['jenkins'] = function(s)
 		local i = 1
@@ -3739,7 +4136,7 @@ local open_math = function(root)
 	end
 
 	r['math']['least_common_multiple'] = function(a, b)
-		return a * b // r['math']['greatest_common_divisor'](a, b)
+		return math.floor(a * b / r['math']['greatest_common_divisor'](a, b))
 	end
 
 	r['math']['round'] = {}
@@ -3857,26 +4254,13 @@ make_env = function(identifier)
 	}
 
 	local open_std_util_help = function()
-		docstrings[r['_VERSION']] = "The current Luaj version"
-		docstrings[r['next']] = "Fetch the next key/value pair from a table."
-		docstrings[r['assert']] = "assert(bool, [message]) - Raise an error message if something is not true."
-		docstrings[r['print']] = "Print a representation of object/s to the console."
-		docstrings[r['printf']] = "printf(formatter, ...) - A formatted print statement."
-		docstrings[r['deepcopy']] = "Returns a copy of an object."
-		docstrings[r['memoize']] = "Wrap a function to memoize results based on inputs."
-		docstrings[r['locals']] = "Get a table _copy_ of current local variables in scope."
-		docstrings[r['items']] = "Unordered iterator"
-		docstrings[r['values']] = "Iterator for sequences."
-		docstrings[r['iter']] = "Ordered iterator."
-		docstrings[r['tonumber']] = "tonumber(obj) - Returns nil or a coerced number value."
-		-- TODO: Other builtins.
+		-- TODO: Builtins...
 		-- TODO: Probably expand to more the single-liners. Any way to sync with docs?
 	end
 
 	r['_VERSION'] = table.concat(luaj_version, '.')
 
 	r['next'] = luaj_next
-	r['assert'] = assert
 	r['print'] = print
 
 	r['printf'] = function(...)
@@ -3923,7 +4307,87 @@ make_env = function(identifier)
 
 	r['type'] = luaj_type
 
-	r['error'] = error
+	-- Better assert messages, like error...
+	r['assert'] = function(v, message)
+		if not v then
+			return r['error'](message or 'An assertion failed.', 2)
+		end
+		return v
+	end
+
+	r['error'] = function(message, level)
+		-- Raise the level by one, because we're implementing our own
+		level = (level or 1) + 1
+
+		-- A default error message.
+		if message == nil then
+			message = 'An unknown error occurred.'
+		end
+
+		local debug_info = debug.getinfo(level)
+
+		-- The file the error occurred in (or C, etc.)
+		local source = debug_info.source or '?.luaj'
+
+		-- The line position the caller definition begins at, if it exists
+		local start_def = debug_info.linedefined or '?'
+
+		-- The line position the caller definition ends at, if it exists
+		local end_def = debug_info.lastlinedefined or '?'
+
+		-- The line where the error occurred, if it exists
+		local error_position = debug_info.currentline or '?'
+
+		-- Try and built a human-readable signature
+		local f = debug_info.func
+		if f ~= nil then
+
+			-- Get the name if possible...
+			local name = debug_info.name or
+				debug.getinfo(f).name or
+				debug.getinfo(level - 1).name or
+				string.format("%s", f)
+
+			-- Collect the arguments
+			local args = {}
+			for i=1, debug.getinfo(f).nparams do
+				if debug.getlocal(f, i) == 'arg' and i == 1 then
+					-- Ignore global arg
+				else
+					-- First locals are always parameters
+					args[#args + 1] = debug.getlocal(f, i) or '?'
+				end
+			end
+
+			-- Add if variadic
+			if debug.getinfo(f).isvararg then
+				args[#args + 1] = '...'
+			end
+
+			-- Construct the signature
+			f = string.format("%s(%s)", name, table.concat(args, ', '))
+		end
+
+		-- Allow non-string error types to fall back
+		if type(message) ~= 'string' then
+			return error(message, level)
+		end
+
+		local err_message = ''
+		err_message = err_message .. string.format("Error: %s\n", message)
+		err_message = err_message .. string.format("Occurred at line %s\n", error_position)
+		err_message = err_message .. string.format("In %s [%s:%s]\n", f, start_def, end_def)
+		err_message = err_message .. '\n'
+		
+		-- TODO: Can we have our own traceback and abort safely into pcall family
+		-- without error?
+		-- Get the traceback from the right position
+		--local traceback = debug.traceback(nil, nil, 2)
+		--io.stderr:write(traceback .. '\n')
+
+		return error(err_message, level)
+	end
+
 	r['pcall'] = pcall
 	r['tostring'] = tostring
 
@@ -3960,7 +4424,32 @@ make_env = function(identifier)
 
 	r['max'] = math.max
 	r['min'] = math.min
-	r['tointeger'] = math.tointeger
+
+	if math.tointeger == nil then
+		-- We have to calculate maxint and minint
+		local maxint, minint = 1
+		while maxint+1 > maxint and 2*maxint > maxint do
+			maxint = maxint * 2
+		end
+		if 2 * maxint <= maxint then
+			maxint = 2*maxint-1
+			minint = -maxint-1
+		else
+			maxint = maxint
+			minint = -maxint
+		end
+
+		-- Create our tointeger function
+		r['tointeger'] = function(n)
+			n = tonumber(n)
+			if type(n) == "number" and n <= maxint and n >= minint and n % 1 == 0 then
+	            return n
+	         end
+	         return nil
+		end
+	else	
+		r['tointeger'] = math.tointeger
+	end
 
 	if io ~= nil then
 		r['stdin'] = io.stdin
@@ -4114,6 +4603,12 @@ make_env = function(identifier)
 	r['operator'] = gen_operator
 
 	r['callable'] = callable
+
+	r['toiterator'] = function(tbl, options)
+		return function()
+			return iter(tbl, options)
+		end
+	end
 
 	r['to'] = gen_operator(function(left, right)
 		if not callable(right) then
@@ -4289,6 +4784,12 @@ load_source = function(source, identifier, lib, env)
 
 			__mod = iformat}
 		);
+
+		lua.debug.setmetatable(true,{
+			__lt = function (x,y)
+				return (not x) and y
+			end
+		})
 	]]
 	meta_header = string.gsub(meta_header, "\n", "")
 
@@ -4330,13 +4831,17 @@ local repl = function()
 
 	local statement_count = 0
 
+	-- TODO: If this isn't interactive, we shouldn't print this information...
 	print(string.format("Luaj v%s", env._VERSION))
 	print("Preface statements with = or return to get their value.")
 	print("Place 'q' alone on its own line to exit.")
-	print("Try `=help(print)`")
 
 	-- If Lua can find linenoise, we should use it. Otherwise, fall back to this behaviour.
-	local L = require 'linenoise'
+	local success, L = pcall(require, 'linenoise')
+	if not success then
+		L = nil
+	end
+
 	local history_filename
 	if L ~= nil then
 		-- TODO: Add completion & hints based on keywords + locals
@@ -4358,6 +4863,7 @@ local repl = function()
 			source = line
 		else
 			io.stdout:write("> ")
+			io.stdout:flush()
 			source = io.stdin:read("*l")
 		end
 		statement_count = statement_count + 1
