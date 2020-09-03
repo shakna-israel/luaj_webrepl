@@ -7,7 +7,7 @@ local load_source = nil
 local make_env = nil
 local docstrings = {}
 
-local luaj_version = {0,12,0}
+local luaj_version = {0,13,0}
 
 local better_random = function(x, y)
 	if x == nil and y == nil then
@@ -472,17 +472,12 @@ local try = function(functor, arguments, except)
 			local error_code
 			if type(data[2]) == 'string' then
 				-- Extract the code, ignoring the program line/position
-				local first = string.find(data[2], ":")
-				local second = string.find(data[2], ":", first+1)
-				error_code = data[2]:sub(second + 2)
+				local first = string.find(data[2], "Error:")
+				local second = string.find(data[2], "\n")
+				error_code = string.sub(data[2], first + 7, second - 1)
 			else
 				error_code = data[2]
 			end
-
-			-- Account for Luaj error message construction
-			error_code = string.sub(error_code, 8)
-			local idx, _ = string.find(error_code, '\n')
-			error_code = string.sub(error_code, 1, idx - 1)
 
 			-- Unaccounted for error, re-raise at the try-caller level.
 			if except[error_code] == nil then
@@ -2771,128 +2766,104 @@ end
 local open_bitop = function(root)
 	local r = root
 
-	-- Compatibility shim...
-	if bit32 == nil then
-		r['bitop'] = {}
+	r['bitop'] = {}
 
-		local bxor = function(a, b)
-			local p,c=1,0
-			while a>0 and b>0 do
-				local ra,rb=a%2,b%2
-				if ra~=rb then
-					c=c+p
-				end
-			
-				a,b,p=(a-ra)/2,(b-rb)/2,p*2
+	local bxor = function(a, b)
+		local p,c=1,0
+		while a>0 and b>0 do
+			local ra,rb=a%2,b%2
+			if ra~=rb then
+				c=c+p
 			end
-			
-			if a<b then
-				a=b
+		
+			a,b,p=(a-ra)/2,(b-rb)/2,p*2
+		end
+		
+		if a<b then
+			a=b
+		end
+		
+		while a>0 do
+			local ra=a%2
+			if ra>0 then
+				c=c+p
 			end
-			
-			while a>0 do
-				local ra=a%2
-				if ra>0 then
-					c=c+p
-				end
-				a,p=(a-ra)/2,p*2
-			end
-			return c
+			a,p=(a-ra)/2,p*2
 		end
-
-		local band = function(a, b)
-			return ((a+b) - bxor(a,b)) / 2
-		end
-
-		local rshift, lshift
-
-		rshift = function(a,disp)
-			if disp < 0 then
-				return lshift(a,-disp)
-			end
-			return math.floor(a % 2^32 / 2^disp)
-		end
-
-		lshift = function(a,disp) -- Lua5.2 inspired
-				if disp < 0 then
-					return rshift(a,-disp)
-				end
-			return (a * 2^disp) % 2^32
-		end
-
-		r['bitop']['extract'] = function(n, field, width)
-			width = width or 1
-				return band(rshift(n, field), 2^width-1)
-		end
-
-		r['bitop']['and0'] = function(x, y)
-			return band(x, y) ~= 0
-		end
-
-		r['bitop']['arshift'] = function(x, disp)
-		local z = rshift(x, disp)
-		if x >= 0x80000000 then
-			z = z + lshift(2^disp-1, 32-disp)
-		end
-			return z
-		end
-
-		r['bitop']['rshift'] = rshift
-
-		local rrotate = function(x, disp)
-			disp = disp % 32
-			local low = band(x, 2^disp-1)
-			return rshift(x, disp) + lshift(low, 32-disp)
-		end
-
-		r['bitop']['lrotate'] = function(x, disp)
-			return rrotate(x, -disp)
-		end
-
-		r['bitop']['rrotate'] = rrotate
-
-		local bnot = function(x)
-			return (-1 - x) % 2^32
-		end
-
-		r['bitop']['replace'] = function(n, v, field, width)
-			width = width or 1
-			local mask1 = 2^width-1
-			v = band(v, mask1)
-			local mask = bnot(lshift(mask1, field))
-			return band(n, mask) + lshift(v, field)
-		end
-
-		r['bitop']['lshift'] = lshift
-		r['bitop']['band'] = band
-		r['bitop']['bxor'] = bxor
-		r['bitop']['bor'] = function(a,b)
-			return (2^32 - 1) - band((2^32 - 1) - a, (2^32 - 1) - b)
-		end
-
-		r['bitop']['bnot'] = bnot
-
-		local meta = getmetatable(r['bitop']) or {}
-		meta.__type = "library"
-		setmetatable(r['bitop'], meta)
-
-		return r
+		return c
 	end
 
-	-- Bit Operations Library
-	r['bitop'] = {}
-	r['bitop']['extract'] = bit32.extract
-	r['bitop']['and0'] = bit32.btest
-	r['bitop']['arshift'] = bit32.arshift
-	r['bitop']['rshift'] = bit32.rshift
-	r['bitop']['lrotate'] = bit32.lrotate
-	r['bitop']['rrotate'] = bit32.rrotate
-	r['bitop']['replace'] = bit32.replace
-	r['bitop']['lshift'] = bit32.lshift
-	r['bitop']['band'] = bit32.band
-	r['bitop']['bxor'] = bit32.bxor
-	r['bitop']['bor'] = bit32.bor
-	r['bitop']['bnot'] = bit32.bnot
+	local band = function(a, b)
+		return ((a+b) - bxor(a,b)) / 2
+	end
+
+	local rshift, lshift
+
+	rshift = function(a,disp)
+		if disp < 0 then
+			return lshift(a,-disp)
+		end
+		return math.floor(a % 2^32 / 2^disp)
+	end
+
+	lshift = function(a,disp) -- Lua5.2 inspired
+			if disp < 0 then
+				return rshift(a,-disp)
+			end
+		return (a * 2^disp) % 2^32
+	end
+
+	r['bitop']['extract'] = function(n, field, width)
+		width = width or 1
+			return band(rshift(n, field), 2^width-1)
+	end
+
+	r['bitop']['and0'] = function(x, y)
+		return band(x, y) ~= 0
+	end
+
+	r['bitop']['arshift'] = function(x, disp)
+	local z = rshift(x, disp)
+	if x >= 0x80000000 then
+		z = z + lshift(2^disp-1, 32-disp)
+	end
+		return z
+	end
+
+	r['bitop']['rshift'] = rshift
+
+	local rrotate = function(x, disp)
+		disp = disp % 32
+		local low = band(x, 2^disp-1)
+		return rshift(x, disp) + lshift(low, 32-disp)
+	end
+
+	r['bitop']['lrotate'] = function(x, disp)
+		return rrotate(x, -disp)
+	end
+
+	r['bitop']['rrotate'] = rrotate
+
+	local bnot = function(x)
+		return (-1 - x) % 2^32
+	end
+
+	r['bitop']['replace'] = function(n, v, field, width)
+		width = width or 1
+		local mask1 = 2^width-1
+		v = band(v, mask1)
+		local mask = bnot(lshift(mask1, field))
+		return band(n, mask) + lshift(v, field)
+	end
+
+	r['bitop']['lshift'] = lshift
+	r['bitop']['band'] = band
+	r['bitop']['bxor'] = bxor
+	r['bitop']['bor'] = function(a,b)
+		return (2^32 - 1) - band((2^32 - 1) - a, (2^32 - 1) - b)
+	end
+
+	r['bitop']['bnot'] = bnot
 
 	local meta = getmetatable(r['bitop']) or {}
 	meta.__type = "library"
@@ -4022,27 +3993,25 @@ local open_hash = function(root)
 		local i = 1
 		local hash = 0
 
-		-- TODO: Remove reliance on bit32
+		-- BUG: jenkins behaves differently under Lua5.3, Luajit and Lua5.4
 
 		while i < #s do
 			hash = hash + string.byte(string.sub(s, i, i))
 			i = i + 1
 			hash = hash + bit32.lshift(hash, 10)
-			hash = hash + bit32.rshift(hash, 6)
+			hash = bit32.bxor(hash, bit32.rshift(hash, 6))
 		end
 		hash = hash + bit32.lshift(hash, 3)
-		hash = hash + bit32.bxor(hash, 3)
+		hash = bit32.bxor(hash, bit32.rshift(hash, 11))
 		hash = hash + bit32.lshift(hash, 15)
 
-		return hash
+		return math.floor(hash)
 	end
 
 	-- adler
 	r['adler'] = function(s)
 		sa = 1
 		sb = 0
-
-		-- TODO: Remove reliance on bit32
 
 		for i = 1, #s do
 			local c = string.byte(string.sub(s, i, i))
@@ -4057,8 +4026,6 @@ local open_hash = function(root)
 	r['fletcher'] = function(s)
 		a = 0
 		b = 0
-
-		-- TODO: Remove reliance on bit32
 
 		for i = 1, #s do
 			local c = string.byte(string.sub(s, i, i))
@@ -4617,40 +4584,45 @@ make_env = function(identifier)
 		return right(left)
 	end)
 
-	enum = setmetatable({}, {
-		__newindex = function(self, key, value)
-			error("Cannot assign to an enum.", 2)
-		end,
-		__index = function(E, k)
-			if type(k) ~= 'string' then
-				error("Cannot reference a non-string enum.", 2)
-			end
+	local make_enum_namespace = function()
+		local enum = setmetatable({}, {
+			__newindex = function(self, key, value)
+				error("Cannot assign to an enum.", 2)
+			end,
+			__index = function(E, k)
+				if type(k) ~= 'string' then
+					error("Cannot reference a non-string enum.", 2)
+				end
 
-			if rawget(E, k) == nil then
-				rawset(E, k, {})
+				if rawget(E, k) == nil then
+					rawset(E, k, {})
 
-				local meta = {
-					__tostring = function(self)
-						return k
-					end,
-					__len = function(self)
-						return 0
-					end,
-					__lt = function(a, b)
-						return true
-					end,
-					__gt = function(a, b)
-						return true
-					end,
-					-- Semiprivate metatable!
-					__metatable = {__type = "enum"}
-				}
-				setmetatable(rawget(E, k), meta)
+					local meta = {
+						__tostring = function(self)
+							return k
+						end,
+						__len = function(self)
+							return 0
+						end,
+						__lt = function(a, b)
+							return true
+						end,
+						__gt = function(a, b)
+							return true
+						end,
+						-- Semiprivate metatable!
+						__metatable = {__type = "enum"}
+					}
+					setmetatable(rawget(E, k), meta)
+				end
+				return rawget(E, k)
 			end
-			return rawget(E, k)
-		end
-	})
-	r['enum'] = enum
+		})
+		return enum
+	end
+	r['enum'] = make_enum_namespace()
+
+	r['enum_namespace'] = make_enum_namespace
 
 	decorator_meta = {__concat =
 		function(a, f)
